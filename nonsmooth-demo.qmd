@@ -1,0 +1,310 @@
+---
+title: "Demonstrating the non-smoothness of N-CV"
+format:
+  html:
+    embed-resources: true
+    anchor-sections: true
+    theme:
+     - cosmo
+---
+
+# Summary
+
+This Quarto document reproduces all results and figures for demonstrating the non-smoothness of the CV curve and the penalization path.
+**With 1 CPUs this code takes about 10 seconds.**
+
+# Setup
+
+```{r}
+#| label: setup
+#| include: false
+library(pense)
+library(here)
+
+here::i_am("application-cav.qmd")
+knitr::opts_chunk$set(warning = FALSE,
+                      error = FALSE,
+                      message = FALSE,
+                      echo = FALSE,
+                      dev = 'png',
+                      fig.align = 'center',
+                      out.width = '100%',
+                      fig.width = 7,
+                      fig.height = 3)
+
+source(here("91-plotting-utils.R"))
+```
+
+
+# Simulate Data & Evaluate Objective Function
+
+```{r}
+#| label: nonsmooth-demo-data
+## Generate data
+n <- 100
+cont <- seq_len(0.3 * n)
+scale <- 0.1
+set.seed(12345)
+x <- rnorm(n)
+y <- 100 * x + rnorm(n, sd = scale)
+y[cont] <- 0.5 * x[cont] + rnorm(length(cont), sd = 0.01)
+
+x_test <- rnorm(10000)
+y_test <- 100 * x_test + rnorm(length(x_test), sd = scale)
+
+## Evaluate penalized M-loss
+beta <- c(seq(0, 1, by = 1e-3), seq(1.1, 99, by = 1e-1), seq(99, 101, by = 1e-3))
+lambda <- c(0, exp(seq(log(1e-3), log(1e-2), length.out = 300)))
+```
+
+
+```{r}
+#| label: nonsmooth-demo-mobj
+eval_mobj <- function (x, y, psi, cc, beta_grid, lambda_grid) {
+  requireNamespace('robustbase')
+  mest_objf <- map(beta_grid, \(b) {
+    r <- (y - x * b)
+    ml <- mean(robustbase::Mpsi(r, cc = cc, psi = psi, deriv = -1))
+    ml + lambda_grid * abs(b)
+  }) %>% 
+    unlist()
+  
+  mest_objf_d1 <- map(beta_grid, \(b) {
+    r <- (y - x * b)
+    mld1 <- -mean(robustbase::Mpsi(r, cc = cc, psi = psi) * x)
+    
+    if (abs(b) < .Machine$double.eps) {
+      ifelse(abs(mld1) < lambda_grid, 0, mld1 - sign(mld1) * lambda_grid)
+    } else {
+      mld1 + sign(b) * lambda_grid
+    }
+  }) %>% 
+    unlist()
+  
+  mest_objf_d2 <- map(beta_grid, \(b) {
+    r <- (y - x * b)
+    mld2 <- -mean(robustbase::Mpsi(r, cc = cc, psi = psi, deriv = 1) * x^2)
+    rep_len(mld2, length(lambda_grid))
+  }) %>% 
+    unlist()
+  
+  tibble(b = rep(beta_grid, each = length(lambda_grid)),
+         l = rep(lambda_grid, length(beta_grid)),
+         obj = unlist(mest_objf),
+         obj_d1 = unlist(mest_objf_d1),
+         obj_d2 = unlist(mest_objf_d2))
+}
+
+mloss_minima_lqq <- eval_mobj(x, y, cc = c(0.2, 1.3, 5), psi = 'lqq',
+                              beta_grid = beta, lambda_grid = lambda)
+
+mloss_minima_lqq_cvfold <- eval_mobj(x[1:90], y[1:90], 
+                                     cc = c(0.2, 1.3, 5), psi = 'lqq',
+                                     beta_grid = beta, lambda_grid = lambda)
+
+mloss_minima_bisq <- eval_mobj(x, y, cc = 2, psi = 'bisquare', 
+                               beta_grid = beta, lambda_grid = lambda)
+
+
+demo_plot_data_bisq <- mloss_minima_bisq %>%
+  group_by(l) %>% 
+  mutate(sp = c(0, abs(diff(sign(obj_d1)))) > 0 | 
+           c(abs(diff(sign(obj_d1))), 0) > 0) %>% 
+  filter(sp) %>% 
+  group_by(gr = cumsum(c(Inf, abs(diff(b))) > max(diff(beta))),
+           .add = TRUE) %>% 
+  filter(abs(obj_d1) == min(abs(obj_d1))) %>% 
+  ungroup() %>% 
+  filter(obj_d2 < 0 | abs(b) < .Machine$double.eps) %>% 
+  group_by(l) %>% 
+  mutate(type_of_minimum = if_else(obj == min(obj),
+                                   "Global minimum",
+                                   "Local minimum")) %>% 
+  ungroup() %>%
+  filter(l > 0)
+
+demo_plot_data_lqq <- mloss_minima_lqq %>%
+  group_by(l) %>% 
+  mutate(sp = c(0, abs(diff(sign(obj_d1)))) > 0 | 
+           c(abs(diff(sign(obj_d1))), 0) > 0) %>% 
+  filter(sp) %>% 
+  group_by(gr = cumsum(c(Inf, abs(diff(b))) > max(diff(beta))),
+           .add = TRUE) %>% 
+  filter(abs(obj_d1) == min(abs(obj_d1))) %>% 
+  ungroup() %>% 
+  filter(obj_d2 < -1e-3 | abs(b) < .Machine$double.eps) %>% 
+  group_by(l) %>% 
+  mutate(type_of_minimum = if_else(obj == min(obj),
+                                   "Global minimum",
+                                   "Local minimum")) %>% 
+  ungroup() %>% 
+  filter(l > 0)
+
+lqq_lambda <- demo_plot_data_lqq %>% 
+  group_by(l) %>% 
+  summarize(d = abs(obj[1] - obj[2]), .groups = 'drop') %>% 
+  filter(d == min(d, na.rm = T)) %>% 
+  pull(l)
+
+bisq_lambda <- demo_plot_data_bisq %>% 
+  group_by(l) %>% 
+  summarize(d = abs(obj[1] - obj[2]), .groups = 'drop') %>% 
+  filter(d == min(d, na.rm = T)) %>% 
+  pull(l)
+```
+
+# Results
+
+## Figure 1.b
+
+```{r}
+#| label: nonsmooth-demo-plot-main
+#| fig-height: 2.5
+#| fig-width: 3.08
+#| fig-cap: |
+#|  RMSPE of the minima of the penalized M-estimator.
+demo_plot_data_bisq %>% 
+  arrange(desc(type_of_minimum)) %>% 
+  ggplot(aes(x = l, y = b, color = type_of_minimum)) +
+  geom_line(data = filter(demo_plot_data_bisq, str_detect(type_of_minimum, 'Global')),
+            linetype = '22', linewidth = 1, show.legend = FALSE) +
+  geom_point(aes(shape = b < 50), size = 2) +
+  scale_color_manual(values = c("Local minimum" = 'gray70',
+                                "Global minimum" = COLORPAL[['blue']])) +
+  scale_shape_manual(values = c("FALSE" = 19,
+                                "TRUE" = 5),
+                     guide = 'none') +
+  scale_x_log10() +
+  scale_y_log10(limits = c(0.3, 300), breaks = c(0.5, 5, 50, 100)) +
+  plottheme() +
+  labs(x = "Penalization level",
+       y = "Location of minimum",
+       color = NULL) +
+  theme(legend.position = 'inside',
+        legend.position.inside = c(0.5, .93),
+        legend.background = element_rect(fill = '#ffffff',
+                                         linewidth = 0.1),
+        legend.margin = margin(1, 5, 1, 0),
+        legend.direction = "horizontal")
+```
+
+
+## Figure S.1
+
+```{r}
+#| label: nonsmooth-demo-plot-suppl
+#| fig-cap: |
+#|  Location of minima for a penalized M-loss function with different $\rho$ functions.
+#|  The gray dots represent local minima at each penalization level, while the blue dot marks
+#|  the global minimum.
+#|  The solid orange line depict the expected value of the minima,
+#|  $\beta_c - \lambda n / (n b - 2)$ and 
+#|  $\beta_\star - \lambda n / (n (1 - b) - 2)$.
+demo_plot_data_comb <- list_rbind(list("LQQ" = demo_plot_data_lqq, 
+                                       "Tukey's Bisquare" = demo_plot_data_bisq),
+                                  names_to = 'Rho')
+
+th_beta <- tibble(l = c(lambda, lambda),
+                  b = c(100 - lambda * n / (n * (1 - 0.3) - 2),
+                        0.5 - lambda * n / (n * 0.3 - 2)),
+                  gr = rep(c('hat(beta)[c]', 'hat(beta)[paste("*")]'),
+                           each = length(lambda))) %>% 
+  filter(l > 0)
+
+demo_plot_data_comb <- list_rbind(list("LQQ" = demo_plot_data_lqq, 
+                                       "Tukey's Bisquare" = demo_plot_data_bisq),
+                                  names_to = 'Rho')
+
+demo_plot_data_comb %>% 
+  arrange(desc(type_of_minimum)) %>% 
+  ggplot(aes(x = l, y = b, color = type_of_minimum)) +
+  geom_line(data = filter(demo_plot_data_comb, str_detect(type_of_minimum, 'Global')),
+            linetype = '22', linewidth = 1, show.legend = FALSE) +
+  geom_point(size = 3) +
+  geom_line(data = th_beta, aes(group = gr), color =  COLORPAL[['orange']],
+            linewidth = 0.7, alpha = 1) +
+  scale_color_manual(values = c("Local minimum" = 'gray70',
+                                "Global minimum" = COLORPAL[['blue']])) +
+  # scale_x_log10(breaks = c(9e-4, 1e-3, 2e-3, 4e-3, 1e-2),
+  #               labels = c('0', '0.001', '0.002', '0.004', '0.01')) +
+  scale_x_log10() +
+  scale_y_log10(limits = c(0.2, 200), breaks = c(0.5, 5, 50, 100)) +
+  plottheme() +
+  facet_grid(cols = vars(Rho)) +
+  labs(x = "Penalization level",
+       y = "Location of minimum",
+       color = NULL)
+```
+
+
+## Additional figures
+
+```{r}
+#| label: nonsmooth-demo-plot-objf
+#| fig-cap: |
+#|  Value of the penalized M-estimate objective function using the LQQ $\rho$ function for
+#|  $\lambda$ such that the two minima have equal value.
+#|  At larger $\lambda$, the minimum close to 0.5 is the global minimum, while for smaller $\lambda$
+#|  the minimum close to 100 is the global minimum.
+
+beta_trans <- scales::new_transform("transform for beta estimate",
+                                    transform = \(x) qnorm((x + 1) / 103),
+                                    inverse = \(x) round(pnorm(x) * 103 - 1), 5)
+
+mloss_minima_lqq %>% 
+  filter(abs(l - lqq_lambda) < .Machine$double.eps) %>% 
+  ggplot(aes(x = b, y = obj)) +
+  geom_line() +
+  scale_x_continuous(transform = beta_trans,
+                     breaks = c(0, 10, 50, 90, 100)) +
+  plottheme() +
+  labs(x = expression(beta),
+       y = "Objective function")
+```
+
+```{r}
+#| label: nonsmooth-demo-plot-objf-2
+#| fig-cap: |
+#|  Value of the penalized M-estimate objective function using the LQQ $\rho$ function for
+#|  $\lambda$ such that the two minima have equal value.
+#|  At larger $\lambda$, the minimum close to 0.5 is the global minimum, while for smaller $\lambda$
+#|  the minimum close to 100 is the global minimum.
+mloss_minima_lqq %>% 
+  filter(abs(l - 1e-2) < .Machine$double.eps) %>% 
+  ggplot(aes(x = b, y = obj)) +
+  geom_line() +
+  scale_x_continuous(transform = beta_trans,
+                     breaks = c(0, 10, 50, 90, 100)) +
+  plottheme() +
+  labs(x = expression(beta),
+       y = "Objective function")
+```
+
+```{r}
+#| label: nonsmooth-demo-plot-objf-cv
+#| fig-cap: |
+#|  Value of the penalized M-estimate objective function using the LQQ $\rho$ function for
+#|  $\lambda=0.0047$ in the full training data (gray dashed line) 
+#|  and the CV fold (blue solid line).
+gd <- guide_legend(title = NULL)
+
+list(
+  `Full training data` = mloss_minima_lqq,
+  `CV Fold` = mloss_minima_lqq_cvfold 
+) %>% 
+  list_rbind(names_to = 'what') %>% 
+  filter(abs(l - 0.0047) < 1e-5) %>% 
+  ggplot(aes(x = b, y = obj, color = what)) +
+  geom_line(aes(linetype = what), linewidth = 0.9) +
+  scale_color_manual(values = unname(COLORPAL[c("blue", "gray")]),
+                     guide = gd) +
+  scale_linetype_manual(values = c('solid', '22'),
+                        guide = gd) +
+  scale_x_continuous(transform = beta_trans,
+                     breaks = c(0, 10, 50, 90, 100)) +
+  plottheme() +
+  labs(x = expression(beta),
+       y = "Objective function")
+```
+
+

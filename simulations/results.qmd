@@ -1,0 +1,1464 @@
+---
+title: "Summary of simulation results"
+format:
+  html:
+    embed-resources: true
+---
+
+```{r}
+#| label: setup
+#| include: false
+library(tidyverse)
+library(kableExtra)
+library(gridExtra)
+library(here)
+library(pense)
+
+dev_pdf <- function (filename, width, height, .path = here("simulations", "figures")) {
+  if (!dir.exists(.path)) {
+    dir.create(.path, mode = '0755', recursive = TRUE)
+  }
+  cairo_pdf(file.path(.path, paste0('sim-', str_remove(basename(filename), coll("-1")))),
+            fallback_resolution = 600,
+            antialias = 'default',
+            width = width,
+            height = height)
+}
+
+knitr::opts_chunk$set(warning = FALSE,
+                      error = FALSE,
+                      message = FALSE,
+                      echo = FALSE,
+                      dev = c('png', 'dev_pdf'),
+                      fig.ext = c('png', 'pdf'),
+                      fig.align = 'center',
+                      out.width = '80%',
+                      fig.width = 7,
+                      fig.height = 3)
+```
+
+```{r}
+#| label: load-utils
+library(tidyverse)
+library(here)
+source(here("91-plotting-utils.R"))
+source(here("simulations/simulation-settings.R"))
+
+eval_cache <- function (expr, file, msg, envir = parent.frame()) {
+  requireNamespace('cli')
+  res <- tryCatch({
+    if (file.exists(file)) {
+      cli::cli_inform(c(i = "{msg} -- loading from cache"))
+      readRDS(file)
+    } else {
+      NULL
+    }
+  }, error = \(e) {
+    cli::cli_alert_warning(c(x = "Error loading cache file.", 
+                             " " = as.character(e)))
+    NULL
+  })
+  
+  if (is.null(res)) {
+    cli::cli_inform(c(i = "{msg} -- computing"))
+    res <- eval(expr, envir = envir)
+    saveRDS(res, file = file)
+  }
+  res
+}
+```
+
+```{r}
+#| label: fixed-simulation-settings
+task_settings_metadata <- eval_cache(
+  file = here("simulations", "results",
+              Sys.getenv("CODE_COMPATIBILITY_VERSION", unset = ''),
+              "task_settings_metadata.rds"),
+  msg = "Generate task metadata",
+  expr = {
+    source(here("simulations/generate_data.R"))
+    map(seq_len(100), \(.seed) {
+      TASK_SETTINGS |> 
+        mutate(setting_id = seq_len(n()),
+               seed = .seed) |> 
+        rowwise() |> 
+        mutate(true_sd = {
+          set.seed(seed)
+          comp_data <- generate_mixed_data(n = n,
+                                           p = p,
+                                           pve = pve,
+                                           resid_dist = resid_dist,
+                                           contamination_percentage = CONT_PERCENT,
+                                           test_n = 10000)
+          list(list(rmse = sqrt(mean(comp_data$clean_residuals^2)),
+                    medape = median(abs(comp_data$clean_residuals)),
+                    mape = mean(abs(comp_data$clean_residuals)),
+                    tau_size = pense::tau_size(comp_data$clean_residuals),
+                    true_coef = list(comp_data$beta)))
+        }) |>
+        ungroup() |> 
+        unnest_wider(true_sd)
+    }) |> 
+      list_rbind()
+  })
+```
+
+
+```{r}
+#| label: util-fun-summarize-results
+
+`%||%` <- function (x, y) {
+  if (isTRUE(is.null(x))) {
+    y
+  } else {
+    x
+  }
+}
+
+#' Summarize a CV result file
+#' 
+#' @param path full path to the results file
+#' @param k number of solutions to consider (for RIS-CV)
+#' @param se_fact SE multiplication factors to consider
+#' @param use_cv_wgts use the CV averaged robustness weights (for RIS-CV)
+#' @param measure either a string or missing
+#' @return a list with two elements: `prediction_accuracy` and `other_stats`.
+summarize_cv_res <- function (path, k = 1:40, se_fact = 0, use_cv_wgts = FALSE,
+                              measure = c('wrmspe', 'wmape', 'auto')) {
+  cv_type <- str_extract(dirname(path), '(\\w+)$')
+  task <- str_match(basename(path), '(\\d+)-(\\d+)')[, -1] |> 
+    as.integer()
+  
+  task_settings <- task_settings_metadata |> 
+    filter(setting_id == task[[1]], seed == task[[2]])
+  
+  measure <- match.arg(measure)
+  if (identical(measure, 'auto')) {
+    measure <- switch(task_settings$resid_dist,
+                      'norm' = 'wrmspe',
+                      'wmape')
+  }
+  
+  sel_ris_measures <- if (isTRUE(use_cv_wgts)) {
+    \(...) {
+      select(...,
+             avg_wrmspe = avg_wrmspe_cv,
+             sd_wrmspe = sd_wrmspe_cv,
+             avg_wmape = avg_wmape_cv,
+             sd_wmape = avg_wmape_cv)
+    }
+  } else {
+    \(...) {
+      select(...,
+             avg_wrmspe,
+             sd_wrmspe,
+             avg_wmape,
+             sd_wmape)
+    }
+  }
+
+  use_first <- \ (pr, solutions = 1) {
+    pr$cvres <- pr$cv_ris |> 
+      filter(solution_index <= solutions) |> 
+      sel_ris_measures(lambda_index, 
+                       solution_index,
+                       avg_tau = avg_tau_size,
+                       sd_tau = sd_tau_size,
+                       lambda, 
+                       alpha) |> 
+      mutate(cvavg = !!as.symbol(paste0('avg_', measure)),
+             cvse  = !!as.symbol(paste0('sd_', measure))) |> 
+      group_by(lambda_index) |> 
+      summarize(across(everything(), ~ .x[[which.min(cvavg)]]),
+                .groups = 'drop')
+    pr
+  }
+  
+  add_true_pred_perf <- \ (x, pr) {
+    x |> 
+      group_by(lambda_index, solution_index) |> 
+      group_modify(\(x, gr) {
+        est <- pr$estimates[[gr$lambda_index]][[gr$solution_index]]
+        bind_cols(x,
+                  tibble(true_tau_size = est$pred_tau_size,
+                         true_rmse = est$pred_rmse,
+                         true_mape = est$pred_mape,
+                         fit_tau_size = est$resid_tau_size))
+      }) |> 
+      ungroup()
+  }
+
+  mcc <- \ (tp, tn, fp, fn) {
+    mcc_numerator <- tp * tn - fp * fn
+    ifelse(abs(mcc_numerator) < .Machine$double.eps, 0,
+           mcc_numerator / sqrt((tp + fp) * (tp + fn) * (tn + fp) * (tn + fn)))
+  }
+  
+  get_varsel_stats <- \ (cvres, estimates) {
+    int2ndderiv <- sum(diff(diff(cvres$cvavg / sum(cvres$cvavg)))^2)
+    map(se_fact, \(.se_fact) {
+      cvres |>
+        filter(pense:::.cv_se_selection(cvavg, cvse, .se_fact) == 'se_fact') |> 
+        mutate(se_fact = .se_fact) |> 
+        rowwise() |> 
+        mutate(varsel = {
+          est_beta <- estimates[[lambda_index]][[solution_index]]$beta
+          true_beta <- as.numeric(task_settings$true_coef[[1]][[1]])
+          est_nz <- abs(est_beta) > .Machine$double.eps
+          true_nz <- abs(true_beta) > .Machine$double.eps
+          
+          list(list(bias_l1 = sum(abs(est_beta - true_beta)),
+                    bias_l2 = sqrt(sum((est_beta - true_beta)^2)),
+                    tp = sum(est_nz & true_nz),
+                    tn = sum(!est_nz & !true_nz),
+                    fp = sum(est_nz & !true_nz),
+                    fn = sum(!est_nz & true_nz)))
+        }) |> 
+        ungroup()
+    }) |> 
+      list_rbind() |> 
+      select(se_fact, alpha, lambda, lambda_index, solution_index, varsel) |> 
+      unnest_wider(varsel) |> 
+      mutate(mcc = mcc(tp, tn, fp, fn),
+             sens = tp / (tp + fn),
+             spec = tn / (tn + fp),
+             int2ndderiv = int2ndderiv)
+  }
+  
+  which_cv_se <- \(cvavg, cvse, se_mult) {
+    which(pense:::.cv_se_selection(cvavg, cvse, se_mult) == 'se_fact')[[1]]
+  }
+
+  pr <- readRDS(path)
+  result <- if (str_starts(cv_type, coll('ris'))) {
+    if (isTRUE(use_cv_wgts) && !isTRUE('avg_wrmspe_cv' %in% colnames(pr$cv_ris))) {
+      return(NULL)
+    } else {
+      list(
+        prediction_accuracy = map(k, \(k) {
+          cvres <- use_first(pr, solutions = k)$cvres
+          map(se_fact, \(se_mult) {
+            cvres |>
+              filter(pense:::.cv_se_selection(cvavg, cvse, se_mult) == 'se_fact') |> 
+              mutate(se_fact = se_mult, k = k) |> 
+              add_true_pred_perf(pr)
+          })
+        }) |>
+          unlist(recursive = FALSE, use.names = FALSE) |> 
+          list_rbind() |> 
+          pivot_longer(starts_with('true'), names_to = 'measure') |> 
+          mutate(measure = str_remove(measure, 'true_'),
+                 cvavg_measure = case_match(measure,
+                                            "tau_size" ~ avg_tau,
+                                            "rmse" ~ avg_wrmspe,
+                                            "mape" ~ avg_wmape),
+                 cvse_measure = case_match(measure,
+                                           "tau_size" ~ sd_tau,
+                                           "rmse" ~ sd_wrmspe,
+                                           "mape" ~ sd_wmape)) |>
+          select(se_fact, 
+                 k, 
+                 cvavg, 
+                 cvse, 
+                 measure,
+                 cvavg_measure,
+                 cvse_measure,
+                 true_accuracy = value),
+        
+        other_stats = map(k, \(.k) {
+          get_varsel_stats(use_first(pr, solutions = .k)$cvres, pr$estimates) |> 
+            mutate(k = .k)
+        }) |> 
+          list_rbind()
+      )
+    }
+  } else {
+    list(
+      prediction_accuracy = map(se_fact, \(se_mult) {
+        pr$cvres |>
+          filter(pense:::.cv_se_selection(cvavg, cvse, se_mult) == 'se_fact') |> 
+          mutate(se_fact = se_mult) |> 
+          add_true_pred_perf(pr)
+      }) |> 
+        list_rbind() |> 
+        pivot_longer(starts_with('true'), names_to = 'measure') |> 
+        mutate(measure = str_remove(measure, 'true_')) |> 
+        select(se_fact,
+               cvavg, 
+               cvse, 
+               measure,
+               true_accuracy = value),
+      
+      other_stats = get_varsel_stats(pr$cvres, pr$estimates)
+    )
+  }
+  
+  result <- result |>
+    lapply(\(x) {
+      x$setting_id <- task[[1]]
+      x$seed <- task[[2]]
+      x$cv_type <- cv_type
+      x
+    })
+  
+  result$setting_id <- task[[1]]
+  result$seed <- task[[2]]
+  result$cv_type <- cv_type
+  result$path <- basename(path)
+  
+  result
+}
+
+summarize_all_files <- function (path, cache, ncores = 1, logfile = '/dev/null', ...) {
+  requireNamespace('parallel', quietly = TRUE)
+  requireNamespace('digest', quietly = TRUE)
+  requireNamespace('stringr', quietly = TRUE)
+  
+  args_hash <- digest::digest(list(...), algo = 'sha256')
+  if (missing(cache)) {
+    cache <- file.path(dirname(path), "cache", 
+                       sprintf("summarize_all_files-%s-%s.rds", basename(path),
+                               stringr::str_sub(args_hash, start = -8)))
+    
+    if (!dir.exists(dirname(cache))) {
+      dir.create(dirname(cache), mode = '0755', recursive = TRUE)
+    }
+  } else if (dir.exists(cache)) {
+    cache <- file.path(cache, 
+                       sprintf("summarize_all_files-%s-%s.rds", basename(path),
+                               stringr::str_sub(args_hash, start = -8)))
+   }
+  
+  if (ncores > 1) {
+    cl <- parallel::makeForkCluster(ncores, outfile = logfile)
+    on.exit(parallel::stopCluster(cl))
+    
+    invisible({
+      parallel::clusterEvalQ(cl, {
+        library(tidyverse)
+      })
+      parallel::clusterExport(cl, c("summarize_cv_res", "%||%", "task_settings_metadata"))
+    })
+    
+    lapply <- \(X, FUN, ...) {
+      parallel::clusterApply(cl = cl, x = X, fun = FUN, ... = ...)
+    }
+  }
+
+  all_summaries_cached <- if (file.exists(cache)) {
+    readRDS(cache)
+  } else {
+    list()
+  }
+  
+  all_summaries_cached <- all_summaries_cached[map_lgl(all_summaries_cached, \(x) !is.null(x$path))]
+  cached_files <- map_chr(all_summaries_cached, \(x) x$path)
+  
+  rds_files <- list.files(path, full.names = TRUE, pattern = '\\d+\\.rds$', recursive = TRUE)
+  files_to_parse <- which(!(basename(rds_files) %in% cached_files))
+  
+  if (length(files_to_parse) > 0L) {
+    cli::cli_inform(c("i" = "Parsing {length(files_to_parse)} additional files"))
+  } else {
+    cli::cli_inform(c("i" = "No additional files to parse."))
+  }
+  all_summaries <- rds_files[files_to_parse] |> 
+    lapply(... = ..., FUN = \(fname, ...) {
+      cli::cli_inform("Summarizing file {basename(fname)}")
+      fname_parts <- str_match(basename(fname), '(\\d{1,3})-(\\d{1,3})')
+      setting_id <- as.integer(fname_parts[[2]])
+      seed <- as.integer(fname_parts[[3]])
+      
+      tryCatch({
+        summarize_cv_res(fname, ...)
+      }, error = \ (cnd) {
+        rlang::warn(sprintf("Cannot summarize CV result file {%s}", fname),
+                    parent = cnd)
+        list(error = as.character(cnd))
+      })
+    }) |> 
+    c(all_summaries_cached)
+  
+  saveRDS(all_summaries, cache)
+  all_summaries
+}
+
+relative_prediction_accuracy <- function (all_summaries, baseline = 'naive') {
+  grouped <- split(all_summaries, map_chr(all_summaries, `[[`, 'cv_type')) |> 
+    map(\(x) {
+      list(setting_id = map_int(x, `[[`, 'setting_id'),
+           seed = map_int(x, `[[`, 'seed'),
+           cv_type = map_chr(x, `[[`, 'cv_type'),
+           pred_accruacy = map(x, `[[`, 'prediction_accuracy')) |> 
+        list2DF() |> 
+        as_tibble()
+    })
+  
+  base <- grouped[[baseline]]
+  grouped[-which(names(grouped) == baseline)] |> 
+    map(\(x) {
+      x |> 
+        inner_join(base, by = join_by(setting_id, seed),
+                  suffix = c('', '_base')) |> 
+        group_by(setting_id, seed, cv_type) |> 
+        group_modify(\(y, gr) {
+          join <- if ('k' %in% colnames(y$pred_accruacy[[1]]) &&
+                      'k' %in% colnames(y$pred_accruacy_base[[1]])) {
+            join_by(se_fact, measure, k)
+          } else {
+            join_by(se_fact, measure)
+          }
+          y$pred_accruacy[[1]] |> 
+            left_join(y$pred_accruacy_base[[1]], by = join,
+                      suffix = c('', '_base')) |> 
+            mutate(true_accuracy_rel = true_accuracy / true_accuracy_base) |> 
+            select(-starts_with('setting_id'),
+                   -starts_with('seed'),
+                   -starts_with('cv_type'),
+                   -starts_with('alpha'))
+        }) |> 
+        ungroup()
+    }) |> 
+    list_rbind()
+}
+```
+
+```{r}
+#| label: util-functions-plotting
+setting_to_str <- function (setting_id, keep_order = TRUE) {
+  str <- with(TASK_SETTINGS[setting_id, ],
+              sprintf("n=%3d, p=%3d, %s",
+                      n, p, case_when(
+                        str_detect(resid_dist, fixed("stable")) ~ "Stable error",
+                        str_detect(resid_dist, fixed("norm")) ~ "Gaussian error",
+                        str_detect(resid_dist, fixed("laplace")) ~ "Laplace error")))
+  if (keep_order) {
+    fct_inorder(str)
+  } else {
+    factor(str)
+  }
+}
+```
+
+```{r}
+#| label: summarize-all-results
+#| cache: true
+all_summaries <- c(
+  here('simulations', 'results/2025-05-01-0cc970c1/') |> 
+    summarize_all_files(
+      use_cv_wgts = FALSE,
+      se_fact = c(0, 1),
+      k = c(1, 5, 10, 20, 30, 40),
+      ncores = 3),
+  here('simulations', 'results/2025-05-01-0cc970c1/ris') |> 
+    summarize_all_files(
+      cache = here('simulations', 'results/cache'),
+      use_cv_wgts = TRUE,
+      se_fact = c(0, 1),
+      k = c(1, 5, 10, 20, 30, 40),
+      ncores = 3) |>
+    lapply(\(x) {
+      x$cv_type <- 'ris_cvwgt'
+      x
+    }),
+  here('simulations', 'results/2025-05-01-0cc970c1/ris_warmcold') |> 
+    summarize_all_files(
+      cache = here('simulations', 'results/cache'),
+      use_cv_wgts = TRUE,
+      se_fact = c(0, 1),
+      k = c(1, 5, 10, 20, 30, 40),
+      ncores = 3) |>
+    lapply(\(x) {
+      x$cv_type <- 'ris_warmcold_cvwgt'
+      x
+    }))
+
+all_summaries <- all_summaries[map_lgl(all_summaries, \(x) !is.null(x$prediction_accuracy))]
+
+filter_summaries <- function (summaries, cv_types) {
+  keep <- summaries |> 
+    map_lgl(\(x) x$cv_type %in% cv_types)
+  summaries[keep]
+}
+
+rel_pred_perf <- all_summaries |> 
+  relative_prediction_accuracy('naive') |> 
+  left_join(task_settings_metadata |> 
+              select(setting_id, seed, rmse, mape, tau_size) |> 
+              pivot_longer(-c(setting_id, seed), names_to = 'measure', values_to = 'true_error_scale'))
+
+rel_pred_perf_ris <- all_summaries |> 
+  filter_summaries(c('ris_cvwgt', 'ris_warmcold', 'ris_warmcold_cvwgt', 'ris')) |> 
+  relative_prediction_accuracy('ris') |> 
+  left_join(task_settings_metadata |> 
+              select(setting_id, seed, rmse, mape, tau_size) |> 
+              pivot_longer(-c(setting_id, seed), names_to = 'measure', values_to = 'true_error_scale'))
+
+rel_pred_perf_ris_warmcold <- all_summaries |> 
+  filter_summaries(c('ris_warmcold', 'ris_warmcold_cvwgt')) |> 
+  relative_prediction_accuracy('ris_warmcold') |> 
+  left_join(task_settings_metadata |> 
+              select(setting_id, seed, rmse, mape, tau_size) |> 
+              pivot_longer(-c(setting_id, seed), names_to = 'measure', values_to = 'true_error_scale'))
+```
+
+```{r}
+merge_with_baseline <- function (all_summaries, baseline) {
+  grouped <- map_chr(all_summaries, `[[`, 'cv_type') |> 
+    split(x = all_summaries) |> 
+    map(\(x) {
+      list(setting_id = map_int(x, `[[`, 'setting_id'),
+           seed = map_int(x, `[[`, 'seed'),
+           cv_type = map_chr(x, `[[`, 'cv_type'),
+           other_stats = map(x, \(y) y$other_stats)) |> 
+        list2DF() |> 
+        as_tibble()
+    })
+  
+  base <- grouped[[baseline]]
+  grouped[-which(names(grouped) == baseline)] |> 
+    map(\(x) {
+      x |> 
+        inner_join(base, by = join_by(setting_id, seed),
+                  suffix = c('', '_base')) |> 
+        group_by(setting_id, seed, cv_type) |> 
+        group_modify(\(y, gr) {
+          join <- if ('k' %in% colnames(y$other_stats[[1]]) &&
+                      'k' %in% colnames(y$other_stats[[1]])) {
+            join_by(se_fact, k)
+          } else {
+            join_by(se_fact)
+          }
+          y$other_stats[[1]] |> 
+            left_join(y$other_stats_base[[1]], by = join,
+                      suffix = c('', '_base')) |> 
+            select(-starts_with('setting_id'),
+                   -starts_with('cv_type'), 
+                   -starts_with('seed'),
+                   -starts_with('alpha'))
+        }) |> 
+        ungroup()
+    }) |> 
+    list_rbind()
+}
+
+merged_ris <- all_summaries |> 
+  filter_summaries(c('ris', 'ris_warmcold')) |> 
+  merge_with_baseline('ris')
+
+merged_ris_warmcold <- all_summaries |> 
+  filter_summaries(c('ris_warmcold', 'ris_warmcold_cvwgt', 'naive')) |> 
+  merge_with_baseline('ris_warmcold')
+```
+
+
+## Difference in Prediction Error
+
+```{r}
+#| label: prediction-errors-relative-to-naive
+#| fig-cap: >
+#|  Prediction accuracy of the PENSE solution selected by RIS-CV relative to the prediction accuracy
+#|  of the PENSE solution selected by N-CV.
+#|  Prediction accuracy is measured by the RMSPE for normal errors and by the MAPE for other error
+#|  distributions, computed on an independent test set of size 10,000.
+#|  The star in each boxplot denotes the arithmetic mean.
+#| out-width: 100%
+#| fig-height: 3
+#| fig-width: 9
+rel_pred_perf |>
+  filter(cv_type == 'ris_warmcold', k == 10,
+         se_fact == 1) |>
+  mutate(setting = setting_to_str(setting_id),
+         measure_for_setting = case_when(
+           str_detect(setting, "Gaussian") ~ "rmse",
+           str_detect(setting, "Laplace") ~ "mape",
+           str_detect(setting, "Stable") ~ "mape"),
+         err_dist = str_extract(setting, "\\w+ error$"),
+         setting_n = str_extract(setting, "n=\\s?\\d+"),
+         setting_p = str_extract(setting, "p=\\s?\\d+") |> 
+           str_remove_all('\\s+') |> 
+           fct_inorder() |> 
+           fct_rev()) |> 
+  filter(measure == measure_for_setting) |> 
+  ggplot(aes(y = setting_p, x = true_accuracy_rel - 1, fill = setting_p)) +
+  geom_vline(xintercept = 0, linewidth = 1, linetype = 'solid', color = "black") +
+  geom_boxplot(notch = TRUE, alpha = 0.9) +
+  geom_point(stat = 'summary', fun = mean, color = 'gray70', size = 10, shape = "*") +
+  scale_fill_manual(values = unname(COLORPAL[c('magenta', 'green', 'blue', 'white')]),
+                    guide = 'none') +
+  scale_x_continuous(breaks = seq(-0.3, 0.3, by = 0.1),
+                     labels = scales::label_percent(style_positive = "plus"),
+                     limits = c(-0.25, 0.25),
+                     expand = expansion(0, 0)) +
+  facet_grid(cols = vars(err_dist),
+             rows = vars(setting_n),
+             scales = 'fixed') +
+  plottheme() +
+  labs(y = "# of covariates",
+       x = "Relative prediction error of RIS-CV to N-CV")
+```
+
+#### Using only full estimates as starting points in CV
+
+```{r}
+#| label: prediction-errors-nshared-to-naive
+#| fig-cap: >
+#|  Prediction accuracy of the PENSE solution selected by N-CV using only the full solutions as
+#|  starting points relative to the prediction accuracy of the PENSE solution selected by N-CV
+#|  re-computing the ENPY starting points.
+#|  Prediction accuracy is measured by the RMSPE for normal errors and by the MAPE for other error
+#|  distributions, computed on an independent test set of size 10,000.
+#|  The star in each boxplot denotes the arithmetic mean.
+#| out-width: 100%
+#| fig-height: 3
+#| fig-width: 9
+rel_pred_perf |> 
+  filter(cv_type == 'sharedstart',
+         se_fact == 1) |>
+  mutate(setting = setting_to_str(setting_id),
+         measure_for_setting = case_when(
+           str_detect(setting, "Gaussian") ~ "rmse",
+           str_detect(setting, "Laplace") ~ "mape",
+           str_detect(setting, "Stable") ~ "mape"),
+         err_dist = str_extract(setting, "\\w+ error$"),
+         setting_n = str_extract(setting, "n=\\s?\\d+"),
+         setting_p = str_extract(setting, "p=\\s?\\d+") |> 
+           str_remove_all('\\s+') |> 
+           fct_inorder() |> 
+           fct_rev()) |> 
+  filter(measure == measure_for_setting) |> 
+  ggplot(aes(y = setting_p, x = true_accuracy_rel - 1, fill = setting_p)) +
+  geom_vline(xintercept = 0, linewidth = 1, linetype = 'solid', color = "black") +
+  geom_boxplot(notch = TRUE, alpha = 0.9) +
+  geom_point(stat = 'summary', fun = mean, color = 'gray70', size = 10, shape = "*") +
+  scale_fill_manual(values = unname(COLORPAL[c('magenta', 'green', 'blue', 'white')]),
+                    guide = 'none') +
+  scale_x_continuous(breaks = seq(-0.3, 0.3, by = 0.1),
+                     labels = scales::label_percent(style_positive = "plus"),
+                     limits = c(-0.25, 0.25),
+                     expand = expansion(0, 0)) +
+  facet_grid(cols = vars(err_dist),
+             rows = vars(setting_n),
+             scales = 'fixed') +
+  plottheme() +
+  labs(y = "# of covariates",
+       x = "Relative prediction error of N-CV (warm) to N-CV")
+```
+
+#### Using two-step CV estimates
+
+```{r}
+#| label: prediction-errors-twostep-to-naive
+#| fig-cap: >
+#|  Prediction accuracy of the PENSE solution selected by N-CV with the two-step approximation
+#|  relative to the prediction accuracy of the PENSE solution selected by N-CV.
+#|  Prediction accuracy is measured by the RMSPE for normal errors and by the MAPE for other error
+#|  distributions, computed on an independent test set of size 10,000.
+#|  The star in each boxplot denotes the arithmetic mean.
+#| out-width: 100%
+#| fig-height: 3
+#| fig-width: 9
+rel_pred_perf |> 
+  filter(cv_type == 'twostepcv',
+         se_fact == 1)  |>
+  mutate(setting = setting_to_str(setting_id),
+         measure_for_setting = case_when(
+           str_detect(setting, "Gaussian") ~ "rmse",
+           str_detect(setting, "Laplace") ~ "mape",
+           str_detect(setting, "Stable") ~ "mape"),
+         err_dist = str_extract(setting, "\\w+ error$"),
+         setting_n = str_extract(setting, "n=\\s?\\d+"),
+         setting_p = str_extract(setting, "p=\\s?\\d+") |> 
+           str_remove_all('\\s+') |> 
+           fct_inorder() |> 
+           fct_rev()) |> 
+  filter(measure == measure_for_setting) |> 
+  ggplot(aes(y = setting_p, x = true_accuracy_rel - 1, fill = setting_p)) +
+  geom_vline(xintercept = 0, linewidth = 1, linetype = 'solid', color = "black") +
+  geom_boxplot(notch = TRUE, alpha = 0.9) +
+  geom_point(stat = 'summary', fun = mean, color = 'gray70', size = 10, shape = "*") +
+  scale_fill_manual(values = unname(COLORPAL[c('magenta', 'green', 'blue', 'white')]),
+                    guide = 'none') +
+  scale_x_continuous(breaks = seq(-0.3, 0.3, by = 0.1),
+                     labels = scales::label_percent(style_positive = "plus"),
+                     limits = c(-0.25, 0.25),
+                     expand = expansion(0, 0)) +
+  facet_grid(cols = vars(err_dist),
+             rows = vars(setting_n),
+             scales = 'fixed') +
+  plottheme() +
+  labs(y = "# of covariates",
+       x = "Relative prediction error of N-CV (two-step approximation) to N-CV")
+```
+
+## Frequency of RIS-CV outperforming N-CV
+
+```{r}
+#| label: prediction-errors-better
+#| fig-cap: >
+#|  Proportion of replicates where RIS-CV is better than N-CV (blue), equivalent to N-CV 
+#|  (within ±1%; light blue) or worse than N-CV (orange).
+#| out-width: 100%
+#| fig-height: 5
+#| fig-width: 7
+task_settings_extended <- TASK_SETTINGS |> 
+  mutate(id = seq_len(n())) |> 
+  rename_all(~ paste0('setting_', .x))
+
+better_than_naive_summary <- rel_pred_perf |> 
+  filter(cv_type == 'ris_warmcold',
+         se_fact == 1) |> 
+  left_join(task_settings_extended, by = join_by(setting_id)) |> 
+  mutate(measure_for_setting = case_when(
+    str_detect(setting_resid_dist, "norm") ~ "rmse",
+    .default = 'mape')) |> 
+  filter(measure == measure_for_setting) |> 
+  group_by(setting_id, seed) |> 
+  mutate(better_than_naive = true_accuracy_rel < 1 - 1e-4,
+         equal_to_naive    = true_accuracy_rel < 1 + 1e-4,
+         worse_than_naive  = 1) |> 
+  ungroup()
+
+better_than_naive_summary |> 
+  group_by(setting_id, k) |> 
+  summarize(across(ends_with('_naive'), mean),
+            across(c(starts_with('setting')), ~ .x[[1L]]),
+            .groups = 'drop') |> 
+  mutate(setting = setting_to_str(setting_id),
+         measure_for_setting = case_when(
+           str_detect(setting, "Gaussian") ~ "rmse",
+           str_detect(setting, "Laplace") ~ "mape",
+           str_detect(setting, "Stable") ~ "mape"),
+         err_dist = str_extract(setting, "\\w+ error$"),
+         setting_n = sprintf("n=%3d", setting_n),
+         setting_p = sprintf("p=%3d", setting_p)) |> 
+  pivot_longer(cols = ends_with('naive')) |> 
+  mutate(name = fct_rev(name)) |> 
+  ggplot(aes(x = k, y = value, color = name)) +
+  geom_area(stat = "identity", position = "identity",
+            aes(fill = name, group = name), alpha = 1) +
+  geom_hline(yintercept = 0.5, linetype = '12', color = 'gray20') +
+  geom_vline(xintercept = 10, linetype = '12', color = 'gray20') +
+  geom_vline(xintercept = 5, linetype = '12', color = 'gray20') +
+  scale_y_continuous(limits = c(0, 1),
+                     expand = expansion(add = c(0, 0)),
+                     labels = scales::label_percent(accuracy = 1)) +
+  scale_x_continuous(expand = expansion(add = 0),
+                     breaks = na.omit(unique(rel_pred_perf$k))) +
+  scale_color_manual(guide = 'none',
+                     values = c('better_than_naive' = COLORPAL[['green']],
+                                'equal_to_naive' = COLORPAL[['blue']],
+                                'worse_than_naive' = COLORPAL[['magenta']])) +
+  scale_fill_manual(guide = 'none',
+                    values = c('better_than_naive' = COLORPAL[['green']],
+                                'equal_to_naive' = COLORPAL[['blue']],
+                                'worse_than_naive' = COLORPAL[['magenta']])) +
+  facet_grid(cols = vars(err_dist),
+             rows = vars(setting_n, setting_p),
+             scales = 'free_x') +
+  plottheme() +
+  theme(panel.spacing = unit(10, 'pt')) +
+  labs(y = "Proportion of simulation replicates",
+       x = "Number of optima (k)")
+```
+
+```{r}
+#| fig-cap: >
+#|   Frequency of RIS-CV outperforming naive CV (N-CV) across all simulation settings.
+better_than_naive_summary |> 
+  group_by(k) |> 
+  summarize(across(ends_with('_naive'), mean),
+            .groups = 'drop') |> 
+  select(k, better_than_naive, equal_to_naive) |> 
+  mutate(across(-k, \(x) scales::label_percent(accuracy = 0.1)(x))) |> 
+  kbl(align = 'rrr',
+      col.names = c("# of minima", "Better than N-CV", "Better than or equal to N-CV")) |> 
+  kable_styling()
+```
+
+
+## Individual CV curves
+
+```{r}
+plot_riscv_naive_curve <- function (res_id, path, max_sol = 10, which = 'rmspe',
+                                    se_fact = 1, plot_true = FALSE,
+                                    what = c('ris_warmcold', 'naive')) {
+  risf <- readRDS(file.path(path, what[[1]], paste0('_', what[[1]], '_', res_id, '.rds')))
+  naivef <- readRDS(file.path(path, what[[2]], paste0('_', what[[2]], '_', res_id, '.rds')))
+  
+  true_measure <- switch(which, rmspe = 'pred_rmse', mape = 'pred_mape')
+  
+  ris <- risf$cv_ris |> 
+    filter(solution_index <= max_sol) |> 
+    group_by(lambda_index) |> 
+    summarize(across(c(lambda, solution_index, ends_with('pe')), ~ .x[[which.min(avg_wrmspe)]]),
+              .groups = 'drop') |> 
+    rename(all_of(c(cvavg = paste0("avg_w", which), 
+                    cvse = paste0("sd_w", which)))) |> 
+    mutate(cvsel = pense:::.cv_se_selection(cvavg, cvse, se_fact)) |> 
+    rowwise() |> 
+    mutate(true_pred = risf$estimates[[lambda_index]][[solution_index]][[true_measure]]) |> 
+    ungroup()
+  
+  naive <- naivef$cvres |> 
+    mutate(cvsel = pense:::.cv_se_selection(cvavg, cvse, se_fact)) |> 
+    left_join(tibble(lambda_index = seq_along(naivef$estimates), 
+                     true_pred = map_dbl(naivef$estimates, \(x) x[[1]][[true_measure]])),
+              join_by(lambda_index))
+  
+  ris_best <- ris |> 
+    filter(cvsel == 'se_fact')
+  naive_best <- naive |> 
+    filter(cvsel == 'se_fact')
+  
+  ris_rmspe <- risf$estimates[[ris_best$lambda_index]][[ris_best$solution_index]]$pred_rmse
+  ris_mape <- risf$estimates[[ris_best$lambda_index]][[ris_best$solution_index]]$pred_mape
+  
+  naive_rmspe <- naivef$estimates[[naive_best$lambda_index]][[1L]]$pred_rmse
+  naive_mape <- naivef$estimates[[naive_best$lambda_index]][[1L]]$pred_mape
+  
+  ylim_true <- range(ris$true_pred, naive$true_pred)
+  
+  plots <- list(ris |>
+                  arrange(cvsel) |> 
+                  ggplot(aes(x = lambda, y = cvavg, color = cvsel)) +
+                  geom_linerange(aes(ymin = cvavg - cvse,
+                                     ymax = cvavg + cvse)) +
+                  geom_label(aes(label = solution_index), size = rel(2)) +
+                  scale_x_log10() +
+                  scale_color_manual(guide = 'none',
+                                     values = c('none' = 'gray20',
+                                                'min' = COLORPAL[["blue"]],
+                                                'se_fact' = COLORPAL[["orange"]])) +
+                  plottheme() +
+                  labs(title = "RIS-CV",
+                       subtitle = sprintf("1-SE solution: RMSPE=%.3f / MAPE=%.3f", ris_rmspe, ris_mape),
+                       x = expression(lambda),
+                       y = paste("Weighted", str_to_upper(which))),
+                
+                naive |>
+                  arrange(cvsel) |> 
+                  ggplot(aes(x = lambda, y = cvavg, color = cvsel)) +
+                  geom_linerange(aes(ymin = cvavg - cvse,
+                                     ymax = cvavg + cvse)) +
+                  geom_label(aes(label = solution_index), size = rel(2)) +
+                  scale_x_log10() +
+                  scale_color_manual(guide = 'none',
+                                     values = c('none' = 'gray20',
+                                                'min' = COLORPAL[["blue"]],
+                                                'se_fact' = COLORPAL[["orange"]])) +
+                  plottheme() +
+                  theme(plot.margin = margin(0.2, 0.7, 0.5, 0.5, 'lines')) +
+                  labs(title = "N-CV",
+                       subtitle = sprintf("1-SE solution: RMSPE=%.3f / MAPE=%.3f", naive_rmspe, naive_mape),
+                       y = expression(tau - "size"),
+                       x = expression(lambda)))
+  
+  if (isTRUE(plot_true)) {
+    c(plots,
+      list(ris |>
+             arrange(cvsel) |> 
+             ggplot(aes(x = lambda, y = true_pred, color = cvsel)) +
+             geom_point() +
+             scale_x_log10() +
+             scale_y_continuous(limits = ylim_true) +
+             scale_color_manual(guide = 'none',
+                                values = c('none' = 'gray20',
+                                           'min' = COLORPAL[["blue"]],
+                                           'se_fact' = COLORPAL[["orange"]])) +
+             plottheme() +
+             labs(subtitle = "True prediction error",
+                  y = str_to_upper(which),
+                  x = expression(lambda)),
+           
+           naive |>
+             arrange(cvsel) |> 
+             ggplot(aes(x = lambda, y = true_pred, color = cvsel)) +
+             geom_point() +
+             scale_x_log10() +
+             scale_y_continuous(limits = ylim_true) +
+             scale_color_manual(guide = 'none',
+                                values = c('none' = 'gray20',
+                                           'min' = COLORPAL[["blue"]],
+                                           'se_fact' = COLORPAL[["orange"]])) +
+             plottheme() +
+             theme(plot.margin = margin(0.2, 0.7, 0.5, 0.5, 'lines')) +
+             labs(subtitle = "True prediction error",
+                  y = str_to_upper(which),
+                  x = expression(lambda))))
+  } else {
+    plots
+  }
+}
+```
+
+```{r}
+#| label: selected-cvcurve-laplace
+#| fig-width: 7
+#| fig-height: 5
+plot_riscv_naive_curve('002-001',
+                       path = here('simulations', 'results/2025-05-01-0cc970c1'),
+                       plot_true = TRUE,
+                       which = 'mape') %>%
+  gridExtra::grid.arrange(grobs = ., ncol = 2, nrow = 2)
+```
+
+```{r}
+#| label: selected-cvcurve-gaussian
+#| fig-width: 7
+#| fig-height: 5
+plot_riscv_naive_curve('004-045',
+                       path = here('simulations', 'results/2025-05-01-0cc970c1'),
+                       plot_true = TRUE,
+                       which = 'rmspe') %>%
+  gridExtra::grid.arrange(grobs = ., ncol = 2, nrow = 2)
+```
+
+
+## Comparing warm & cold starts
+
+```{r}
+#| label: load-ris-wc-diff
+#| cache: true
+ris_wc_cor_comparison <- here("simulations", "results/2025-05-01-0cc970c1/ris_warmcold/") |> 
+  list.files(full.names = TRUE) |> 
+  map(\(riswc_f) {
+    task <- str_match(basename(riswc_f), '(\\d+)-(\\d+)')[, -1] |> 
+      as.integer()
+    ris_f <- here("simulations", "results/2025-05-01-0cc970c1/ris/",
+                  sprintf("_ris_%03d-%03d.rds", task[[1]], task[[2]]))
+    if (!file.exists(ris_f)) {
+      return(NULL)
+    }
+    
+    measure <- switch(TASK_SETTINGS$resid_dist[[task[[1]]]],
+                      "norm" = "wrmspe",
+                      "wmape")
+    
+    riswc <- readRDS(riswc_f) |> 
+      change_cv_measure(measure = measure, max_solutions = 10)
+    ris <- readRDS(ris_f) |> 
+      change_cv_measure(measure = measure, max_solutions = 10)
+    
+    ris$cvres <- ris$cvres |> 
+      mutate(cvsel = pense:::.cv_se_selection(cvavg, cvse, 1))
+    
+    riswc$cvres <-  riswc$cvres |> 
+      mutate(cvsel = pense:::.cv_se_selection(cvavg, cvse, 1))
+    
+    ris_best <- c(which(ris$cvres$cvsel == 'min'),
+                  which(ris$cvres$cvsel == 'se_fact')) |> 
+      rep(length.out = 2)
+    
+    riswc_best <- c(which(riswc$cvres$cvsel == 'min'),
+                    which(riswc$cvres$cvsel == 'se_fact')) |> 
+      rep(length.out = 2)
+    
+    ris_sim <- ris$cvres |> 
+      left_join(ris$cv_ris |>
+                  rename(any_of(c(similarity = "rankcorr"))) |> 
+                  select(lambda_index, solution_index, avg_similarity, similarity),
+                join_by(lambda_index, solution_index))
+    
+    riswc_sim <- riswc$cvres |> 
+      left_join(riswc$cv_ris |> 
+                  rename(any_of(c(similarity = "rankcorr"))) |> 
+                  select(lambda_index, solution_index, avg_similarity, similarity),
+                join_by(lambda_index, solution_index))
+    
+    tibble(setting_id          = task[[1]],
+           seed                = task[[2]],
+           riswc_time          = riswc$timinig[[1]],
+           ris_time            = ris$timinig[[1]],
+           measure             = measure,
+           similarity_min_diff = riswc_sim$avg_similarity[[riswc_best[[1]]]] -
+             ris_sim$avg_similarity[[ris_best[[1]]]],
+           similarity_se_diff  = riswc_sim$avg_similarity[[riswc_best[[2]]]] -
+             ris_sim$avg_similarity[[ris_best[[2]]]],
+           similarity_pearson  = cor(unlist(ris_sim$similarity, FALSE, FALSE),
+                                     unlist(riswc_sim$similarity, FALSE, FALSE)),
+           similarity_l2diff   = norm(unlist(ris_sim$similarity, FALSE, FALSE) - 
+                                       unlist(riswc_sim$similarity, FALSE, FALSE), "2"),
+           similarity_diff      = mean(unlist(riswc_sim$similarity, FALSE, FALSE) -
+                                         unlist(ris_sim$similarity, FALSE, FALSE)))
+  }) |> 
+  list_rbind()
+```
+
+```{r}
+#| label: rev-ris-vs-riswarmcold
+#| fig-width: 11
+#| fig-height: 7
+#| fig-cap: >
+#|   Comparisons of RIS-CV (cold) against RIS-CV (warm) across all settings in the simulation study.
+#|   Boxplot (a) depicts the increase in computation time for RIS-CV (cold) relative to RIS-CV (warm).
+#|   The boxplots in (b) show the difference in the similarities of the matched minima.
+#|   The plots in (c) show the chosen $\lambda$ 
+timing_plot <- ris_wc_cor_comparison |> 
+  mutate(time_rel = riswc_time / ris_time) |> 
+  ggplot(aes(y = time_rel)) +
+  geom_boxplot() +
+  scale_x_continuous(breaks = numeric()) +
+  plottheme() +
+  theme(plot.margin = margin(0.2, 1, 2.2, 0.2, 'lines')) +
+  labs(x = NULL,
+       y = "Relative computation time of\nRIS-CV (cold) vs. RIS-CV (warm)",
+       tag = "(a)")
+
+sim_diff_plot <- ris_wc_cor_comparison |> 
+  select(similarity_min_diff, similarity_se_diff, similarity_diff) |> 
+  pivot_longer(everything()) |> 
+  mutate(name = case_match(name,
+                           "similarity_diff" ~ "atop('Avg. across all', 'differences')",
+                           "similarity_min_diff" ~ "atop('Avg. similarity', 'at minimum ' * lambda)",
+                           "similarity_se_diff" ~ "atop('Avg. similarity', 'at 1-SE ' * lambda)") |> 
+           fct_inorder()) |> 
+  ggplot(aes(x = name, y = value)) +
+  geom_boxplot() +
+  scale_y_continuous(breaks = seq(-0.1, 0.3, by = 0.1),
+                     labels = sprintf("%+.1f", seq(-0.1, 0.3, by = 0.1)) |> 
+                       str_replace(fixed("+0.0"), "0") |> 
+                       str_replace(fixed("-"), "–")) +
+  scale_x_discrete(labels = scales::label_parse()) +
+  plottheme() +
+  theme(plot.margin = margin(0.2, 0.4, 0, 1, 'lines')) +
+  labs(x = NULL,
+       y = "Difference in similarities",
+       tag = "(c)")
+
+pred_err_plot <- rel_pred_perf_ris |>
+  filter(cv_type == 'ris_warmcold', k == 10,
+         se_fact == 1) |>
+  mutate(setting = setting_to_str(setting_id),
+         measure_for_setting = case_when(
+           str_detect(setting, "Gaussian") ~ "rmse",
+           str_detect(setting, "Laplace") ~ "mape",
+           str_detect(setting, "Stable") ~ "mape"),
+         err_dist = str_extract(setting, "\\w+ error$"),
+         setting_n = str_extract(setting, "n=\\s?\\d+"),
+         setting_p = str_extract(setting, "p=\\s?\\d+") |> 
+           str_remove_all('\\s+') |> 
+           fct_inorder() |> 
+           fct_rev()) |> 
+  filter(measure == measure_for_setting) |> 
+  ggplot(aes(y = true_accuracy_rel - 1)) +
+  geom_boxplot(notch = TRUE) +
+  scale_y_continuous(breaks = seq(-0.3, 0.3, by = 0.1),
+                     labels = scales::label_percent(style_positive = "plus"),
+                     limits = c(-0.33, 0.33),
+                     expand = expansion(0, 0)) +
+  scale_x_continuous(breaks = numeric(0)) +
+  plottheme() +
+  theme(plot.margin = margin(0.2, 0.4, 2.2, 0.2, 'lines')) +
+  labs(x = NULL,
+       y = "Relative prediction error of\nRIS-CV (cold) to RIS-CV (warm)",
+       tag = "(b)")
+
+lambda_diff_plot <- merged_ris |> 
+  filter(cv_type == 'ris_warmcold', k == 10) |> 
+  select(setting_id, seed, starts_with('lambda_index'), se_fact) |> 
+  pivot_longer(starts_with('lambda_index')) |> 
+  mutate(type = if_else(str_ends(name, '_base'), 'warm', 'cold'),
+         name = case_match(se_fact,
+                           0 ~ 'paste(lambda, " at best prediction error")',
+                           1 ~ 'paste(lambda, " chosen by the 1-SE-rule")') |> 
+           fct_inorder()) |>
+  pivot_wider(names_from = 'type', values_from = 'value') |> 
+  ggplot(aes(x = -warm, y = -cold)) +
+  geom_hex() +
+  geom_abline(slope = 1) +
+  scale_fill_gradient(low = '#f0f0f0', high = '#000',
+                      rescale = \(x, from) 0.5 + 0.5 * tanh(4 * (scales::rescale(x, from = from) - 0.5))) +
+  scale_x_continuous(breaks = c(-47, -3),
+                     limits = c(-50, 1),
+                     oob = ~ .,
+                     minor_breaks = seq(-50, 0, by = 10),
+                     labels = c("Smallest", "Largest")) +
+  scale_y_continuous(breaks = c(-49.9, -0.1),
+                     limits = c(-50, 1),
+                     oob = ~ .,
+                     minor_breaks = seq(-50, 0, by = 10),
+                     labels = c("Smallest", "Largest")) +
+  facet_grid(cols = vars(name), labeller = 'label_parsed') +
+  plottheme() +
+  coord_fixed() +
+  theme(panel.grid.minor = element_line(color = 'gray30', linewidth = rel(0.5), linetype='dotted'),
+        panel.grid.major = element_blank(),
+        axis.ticks = element_blank(),
+        plot.margin = margin(0.2, 1, 0.5, 0.2, 'lines')) +
+  labs(x = expression(lambda * " chosen with RIS-CV (warm)"),
+       y = expression(lambda * " chosen with RIS-CV (cold)"),
+       fill = "Frequency",
+       tag = "(d)")
+
+gridExtra::grid.arrange(timing_plot, pred_err_plot, sim_diff_plot, lambda_diff_plot,
+                        layout_matrix = matrix(rep(1:4, times = c(22, 22, 56, 100)), 
+                                               byrow = TRUE,
+                                               nrow = 2, ncol = 100))
+```
+
+## Comparing average CV weights
+
+```{r}
+plot_riscv_curve <- function (f, max_sol = 10, which = 'rmspe') {
+  x <- readRDS(f)
+  
+  ris <- x$cv_ris |> 
+    filter(solution_index <= max_sol) |> 
+    group_by(lambda_index) |> 
+    summarize(across(c(lambda, solution_index, ends_with('pe')), ~ .x[[which.min(avg_wrmspe)]]),
+              .groups = 'drop') |> 
+    rename(all_of(c(cvavg = paste0("avg_w", which), 
+                    cvse = paste0("sd_w", which)))) |> 
+    mutate(cvsel = pense:::.cv_se_selection(cvavg, cvse, 1))
+  
+  ris_cvwgt <- if (paste0("avg_w", which, "_cv") %in% colnames(x$cv_ris)) {
+    x$cv_ris |> 
+      filter(solution_index <= max_sol) |> 
+      group_by(lambda_index) |> 
+      summarize(across(c(lambda, solution_index, ends_with('pe_cv')), ~ .x[[which.min(avg_wrmspe)]]),
+                .groups = 'drop') |> 
+      rename(all_of(c(cvavg = paste0("avg_w", which, "_cv"), 
+                      cvse = paste0("sd_w", which, "_cv")))) |> 
+      mutate(cvsel = pense:::.cv_se_selection(cvavg, cvse, 1))
+  } else {
+    ris
+  }
+  
+  ris_best <- ris |> 
+    filter(cvsel == 'se_fact')
+  ris_cvwgt_best <- ris_cvwgt |> 
+    filter(cvsel == 'se_fact')
+  
+  ris_rmspe <- x$estimates[[ris_best$lambda_index]][[ris_best$solution_index]]$pred_rmse
+  ris_mape <- x$estimates[[ris_best$lambda_index]][[ris_best$solution_index]]$pred_mape
+  ris_cvwgt_rmspe <- x$estimates[[ris_cvwgt_best$lambda_index]][[ris_cvwgt_best$solution_index]]$pred_rmse
+  ris_cvwgt_mape <- x$estimates[[ris_cvwgt_best$lambda_index]][[ris_cvwgt_best$solution_index]]$pred_mape
+  
+  ylim <- c(min(ris$cvavg - ris$cvse, ris_cvwgt$cvavg - ris_cvwgt$cvse),
+            max(ris$cvavg + ris$cvse, ris_cvwgt$cvavg + ris_cvwgt$cvse))
+  
+  list(ris |>
+         arrange(cvsel) |> 
+         ggplot(aes(x = lambda, y = cvavg, color = cvsel)) +
+         geom_linerange(aes(ymin = cvavg - cvse,
+                            ymax = cvavg + cvse)) +
+         geom_label(aes(label = solution_index), size = rel(2)) +
+         scale_x_log10() +
+         scale_y_continuous(limits = ylim) +
+         scale_color_manual(guide = 'none',
+                            values = c('none' = 'gray20',
+                                       'min' = COLORPAL[["blue"]],
+                                       'se_fact' = COLORPAL[["orange"]])) +
+         plottheme() +
+         labs(title = "Weights from fit to complete data",
+              subtitle = sprintf("1-SE solution: RMSPE=%.3f / MAPE=%.3f", ris_rmspe, ris_mape),
+              x = expression(lambda),
+              y = paste("Weighted", str_to_upper(which))),
+       
+       ris_cvwgt |>
+         arrange(cvsel) |> 
+         ggplot(aes(x = lambda, y = cvavg, color = cvsel)) +
+         geom_linerange(aes(ymin = cvavg - cvse,
+                            ymax = cvavg + cvse)) +
+         geom_label(aes(label = solution_index), size = rel(2)) +
+         scale_x_log10() +
+         scale_y_continuous(limits = ylim) +
+         scale_color_manual(guide = 'none',
+                            values = c('none' = 'gray20',
+                                       'min' = COLORPAL[["blue"]],
+                                       'se_fact' = COLORPAL[["orange"]])) +
+         plottheme() +
+         theme(axis.text.y = element_blank(),
+               axis.ticks.y = element_blank(),
+               axis.title.y = element_blank()) +
+         labs(title = "Average weights from CV fits",
+              subtitle = sprintf("1-SE solution: RMSPE=%.3f / MAPE=%.3f", ris_cvwgt_rmspe, ris_cvwgt_mape),
+              x = expression(lambda)))
+}
+```
+
+```{r}
+#| label: load-ris-compare-cvwgt
+#| cache: true
+ris_prederr_cvwgt_to_normal <- here('simulations', 'results/2025-05-01-0cc970c1/ris_warmcold/') |> 
+  list.files(full.names = TRUE) |>
+  map(\(f) {
+    task <- str_match(basename(f), "(\\d{3})-(\\d{3})")
+    
+    x <- readRDS(f)
+    
+    if (isFALSE("avg_wrmspe_cv" %in% colnames(x$cv_ris))) {
+      return(NULL)
+    }
+    
+    x$cv_ris |> 
+      select(lambda_index, solution_index, starts_with("avg")) |> 
+      transmute(`WRMSPE_cvwgt_to_normal` = avg_wrmspe_cv / avg_wrmspe,
+                `WMAPE_cvwgt_to_normal`  = avg_wmape_cv / avg_wmape) |> 
+      mutate(setting_id = as.integer(task[[2]]),
+             seed = as.integer(task[[3]]))
+  }) |> 
+  bind_rows()
+```
+
+```{r}
+#| label: rev-ris-naive-lambda
+#| fig-width: 7
+#| fig-height: 3
+merged_ris_warmcold |> 
+  filter(cv_type == 'naive', k == 10) |> 
+  select(setting_id, seed, starts_with('lambda_index'), se_fact) |> 
+  group_by(se_fact) |> 
+  summarize(across(starts_with("lambda_index"), list(small = ~ mean(.x >= 49),
+                                                     large = ~ mean(.x <= 2),
+                                                     extreme = ~mean (.x <= 2 | .x >= 49)))) |> 
+  pivot_longer(-se_fact) |> 
+  mutate(dir = str_extract(name, '[^_]+$'),
+         cv_type = if_else(str_detect(name, fixed("_base_")),
+                           "ris",
+                           "naive")) |> 
+  select(-name) |>
+  pivot_wider(names_from = cv_type, values_from = value)
+
+merged_ris_warmcold |> 
+  filter(cv_type == 'naive', k == 10) |> 
+  select(setting_id, seed, starts_with('lambda_index'), se_fact) |>
+  pivot_longer(starts_with('lambda_index')) |>
+  mutate(type = if_else(str_ends(name, '_base'), 'ris_warmcold', 'naive'),
+         name = case_match(se_fact,
+                           0 ~ 'paste(lambda, " at best prediction error")',
+                           1 ~ 'paste(lambda, " chosen by the 1-SE-rule")') |> 
+           fct_inorder()) |>
+  pivot_wider(names_from = 'type', values_from = 'value') |> 
+  ggplot(aes(x = -naive, y = -ris_warmcold)) +
+  geom_hex() +
+  geom_abline(slope = 1) +
+  scale_fill_gradient(low = '#f0f0f0', high = '#000',
+                      rescale = \(x, from) 0.5 + 0.5 * tanh(4 * (scales::rescale(x, from = from) - 0.5))) +
+  scale_x_continuous(breaks = c(-47, -3),
+                     limits = c(-50, 1),
+                     oob = ~ .,
+                     minor_breaks = seq(-50, 0, by = 10),
+                     labels = c("Smallest", "Largest")) +
+  scale_y_continuous(breaks = c(-49.9, -0.1),
+                     limits = c(-50, 1),
+                     oob = ~ .,
+                     minor_breaks = seq(-50, 0, by = 10),
+                     labels = c("Smallest", "Largest")) +
+  facet_grid(cols = vars(name), labeller = 'label_parsed') +
+  plottheme() +
+  coord_fixed() +
+  theme(panel.grid.minor = element_line(color = 'gray30', linewidth = rel(0.5), linetype='dotted'),
+        panel.grid.major = element_blank(),
+        axis.ticks = element_blank()) +
+  labs(x = expression(lambda * " chosen by N-CV"),
+       y = expression(lambda * " chosen by RIS-CV"),
+       fill = "Frequency")
+```
+
+```{r}
+#| label: rev-riscvwgt-vs-ris-plots
+#| fig-width: 11
+#| fig-height: 7
+cv_curves <- plot_riscv_curve(
+  here('simulations', 'results/2025-05-01-0cc970c1/ris_warmcold/_ris_warmcold_002-001.rds'),
+  which = 'mape')
+
+cv_curves[[1]] <- cv_curves[[1]] +
+  labs(tag = "(a)")
+cv_curves[[2]] <- cv_curves[[2]] +
+  theme(plot.margin = margin(1.1, 1, 0.5, 0, 'lines')) 
+
+rel_size_prederr <- ris_prederr_cvwgt_to_normal |> 
+  transmute(`WRMSPE` = WRMSPE_cvwgt_to_normal,
+            `WMAPE`  = WMAPE_cvwgt_to_normal) |> 
+  pivot_longer(everything()) |> 
+  ggplot(aes(x = name, y = value - 1)) +
+  # geom_boxplot(notch = TRUE) +
+  geom_violin(notch = TRUE) +
+  geom_hline(yintercept = 0, linetype = '22', linewidth = 0.8) +
+  scale_y_continuous(breaks = seq(-0.8, 0.8, by = 0.2),
+                     labels = scales::label_percent(style_positive = "plus"),
+                     limits = c(-0.83, 0.83),
+                     expand = expansion(0, 0)) +
+  plottheme() +
+  labs(x = NULL,
+       y = "Relative size",
+       title = " ",
+       subtitle = " ",
+       tag = "(b)")
+
+pred_err_plot <- rel_pred_perf_ris_warmcold |>
+  filter(k == 10,
+         se_fact == 1) |>
+  mutate(setting = setting_to_str(setting_id),
+         measure_for_setting = case_when(
+           str_detect(setting, "Gaussian") ~ "rmse",
+           str_detect(setting, "Laplace") ~ "mape",
+           str_detect(setting, "Stable") ~ "mape"),
+         err_dist = str_extract(setting, "\\w+ error$"),
+         setting_n = str_extract(setting, "n=\\s?\\d+"),
+         setting_p = str_extract(setting, "p=\\s?\\d+") |> 
+           str_remove_all('\\s+') |> 
+           fct_inorder() |> 
+           fct_rev()) |> 
+  filter(measure == measure_for_setting) |> 
+  ggplot(aes(y = true_accuracy_rel - 1)) +
+  geom_boxplot(notch = TRUE) +
+  scale_y_continuous(breaks = seq(-0.3, 0.3, by = 0.1),
+                     labels = scales::label_percent(style_positive = "plus"),
+                     limits = c(-0.33, 0.33),
+                     expand = expansion(0, 0)) +
+  scale_x_continuous(breaks = numeric(0)) +
+  plottheme() +
+  theme(plot.margin = margin(0.2, 1, 2.2, 0.2, 'lines')) +
+  labs(x = NULL,
+       y = "Relative prediction error of RIS-CV\nusing avg. weights from CV fits vs. weights from complete fit",
+       tag = "(c)")
+
+lambda_diff_plot <- merged_ris_warmcold |> 
+  filter(cv_type == 'ris_warmcold_cvwgt', k == 10) |> 
+  select(setting_id, seed, starts_with('lambda_index'), se_fact) |> 
+  pivot_longer(starts_with('lambda_index')) |> 
+  mutate(type = if_else(str_ends(name, '_base'), 'fullwgt', 'cvwgt'),
+         name = case_match(se_fact,
+                           0 ~ 'paste(lambda, " at best prediction error")',
+                           1 ~ 'paste(lambda, " chosen by the 1-SE-rule")') |> 
+           fct_inorder()) |>
+  pivot_wider(names_from = 'type', values_from = 'value') |> 
+  ggplot(aes(x = -fullwgt, y = -cvwgt)) +
+  geom_hex() +
+  geom_abline(slope = 1) +
+  scale_fill_gradient(low = '#f0f0f0', high = '#000',
+                      rescale = \(x, from) 0.5 + 0.5 * tanh(4 * (scales::rescale(x, from = from) - 0.5))) +
+  scale_x_continuous(breaks = c(-47, -3),
+                     limits = c(-50, 1),
+                     oob = ~ .,
+                     minor_breaks = seq(-50, 0, by = 10),
+                     labels = c("Smallest", "Largest")) +
+  scale_y_continuous(breaks = c(-49.9, -0.1),
+                     limits = c(-50, 1),
+                     oob = ~ .,
+                     minor_breaks = seq(-50, 0, by = 10),
+                     labels = c("Smallest", "Largest")) +
+  facet_grid(cols = vars(name), labeller = 'label_parsed') +
+  plottheme() +
+  coord_fixed() +
+  theme(panel.grid.minor = element_line(color = 'gray30', linewidth = rel(0.5), linetype='dotted'),
+        panel.grid.major = element_blank(),
+        axis.ticks = element_blank()) +
+  labs(x = expression(lambda * " chosen with weights from fit to complete data"),
+       y = expression(lambda * " chosen with average weights from CV fits"),
+       fill = "Frequency",
+       tag = "(d)")
+
+gridExtra::grid.arrange(cv_curves[[1]], cv_curves[[2]], rel_size_prederr, 
+                        pred_err_plot, lambda_diff_plot,
+                        layout_matrix = matrix(rep(1:5, 
+                                                   times = c(38, 38, 24, 25, 75)), 
+                                               byrow = TRUE,
+                                               nrow = 2, ncol = 100))
+```
+
+```{r}
+#| label: rev-ris-vs-naive-example
+#| fig-width: 7
+#| fig-height: 2.5
+plot_riscv_naive_curve('008-098',
+                       path = here('simulations', 'results/2025-05-01-0cc970c1'),
+                       which = 'mape') %>%
+  gridExtra::grid.arrange(grobs = ., ncol = 2, nrow = 1)
+```
+
+
+## Smoothness
+
+```{r}
+#| label: extract-discontinuity
+#| cache: true
+extract_discontinuity_scores <- function (path, max_sol = 10) {
+  list.files(file.path(path, "ris_warmcold")) |> 
+    map(\(ris_fname) {
+      task <- as.integer(str_match(ris_fname, "(\\d{3})-(\\d{3})")[, 2:3])
+      ris <- readRDS(file.path(path, "ris_warmcold", ris_fname))
+      naive <- readRDS(file.path(path, "naive", 
+                                 sprintf("_naive_%03d-%03d.rds", task[[1]], task[[2]])))
+      
+      measure <- switch(TASK_SETTINGS$resid_dist[task[[1]]],
+                        "norm" = "wrmspe",
+                        "wmape")
+      
+      ris <- ris |> 
+        change_cv_measure(measure, max_solutions = max_sol)
+      
+      ris$cvres <- head(ris$cvres, 20)
+      naive$cvres <- head(naive$cvres, 20)
+      
+      l1_coefs <- \(x) {
+        map2_dbl(x$cvres$lambda_index, x$cvres$solution_index, \ (i, j) {
+          sum(abs(x$estimates[[i]][[j]]$std_beta))
+        })
+      }
+      
+      discont_score <- \(x) {
+        c(max_abs_diff = max(abs(diff(x))),
+          wiggly       = sum(diff(diff(x))^2))
+      }
+
+      tibble(setting_id = task[[1]],
+             seed       = task[[2]],
+             ris_cv     = discont_score(ris$cvres$cvavg),
+             naive_cv   = discont_score(naive$cvres$cvavg),
+             ris_coef   = discont_score(l1_coefs(ris)),
+             naive_coef = discont_score(l1_coefs(naive))) |> 
+        mutate(measure = c("max_abs_diff", "wigglyness"))
+    }) |> 
+    list_rbind()
+}
+
+discont_scores <- extract_discontinuity_scores(here("simulations", "results/2025-05-01-0cc970c1"))
+```
+
+```{r}
+#| label: rev-smoothness
+#| fig-width: 7
+#| fig-height: 3
+smooth_cv_cuvres <- discont_scores |> 
+  mutate(resid = setting_to_str(setting_id) |> 
+           str_extract('[A-Za-z]+ error')) |> 
+  pivot_longer(ends_with("_cv")) |> 
+  mutate(name = case_match(name,
+                           "ris_cv" ~ "RIS-CV",
+                           "naive_cv" ~ "N-CV"),
+         measure = case_match(measure,
+                              'max_abs_diff' ~ 'Max. absolute difference',
+                              'wigglyness'   ~ 'Sum of squared 2nd-order differences')) |> 
+  ggplot(aes(y = name, x = value, fill = name)) +
+  geom_boxplot() +
+  scale_x_log10() +
+  scale_fill_manual(values = c(COLORPAL[['blue']], COLORPAL[['green']]), guide = "none") +
+  facet_grid(cols  = vars(measure), scale = "free_x") +
+  plottheme() +
+  labs(x = NULL, y = NULL, tag = "(a)", title = "Smoothness of CV curves")
+
+smooth_l1_norm <- discont_scores |> 
+  mutate(resid = setting_to_str(setting_id) |> 
+           str_extract('[A-Za-z]+ error')) |> 
+  pivot_longer(ends_with("_coef")) |> 
+  mutate(name = case_match(name,
+                           "ris_coef" ~ "RIS-CV",
+                           "naive_coef" ~ "N-CV"),
+         measure = case_match(measure,
+                              'max_abs_diff' ~ 'Max. absolute difference',
+                              'wigglyness'   ~ 'Sum of squared 2nd-order differences')) |> 
+  ggplot(aes(y = name, x = value, fill = name)) +
+  geom_boxplot() +
+  scale_x_log10() +
+  scale_fill_manual(values = c(COLORPAL[['blue']], COLORPAL[['green']]), guide = "none") +
+  facet_grid(cols  = vars(measure), scale = "free_x") +
+  plottheme() +
+  labs(x = NULL, y = NULL, tag = "(b)", title = "Smoothness of regularization path (L1 norm)")
+
+gridExtra::grid.arrange(smooth_cv_cuvres, smooth_l1_norm, nrow = 2, ncol = 1)
+```

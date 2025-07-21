@@ -1,0 +1,446 @@
+---
+title: "Application I: Biomarker discovery study for Cardiac Allograft Vasculopathy"
+format:
+  html:
+    embed-resources: true
+    anchor-sections: true
+    theme:
+     - cosmo
+---
+
+# Summary
+
+This Quarto document reproduces all results and figures for the biomarker discovery study (CAV).
+**With 3 CPUs this code takes about 30 minutes.**
+The code below is configured to use 3 CPUs but it can be adjusted according to the local machine's available resources.
+
+The document is structured as follows:
+
+* Under [Setup](#setup), the document properties are set for proper rendering of the results and the dataset is read from disk.
+  The user may choose to change the number of CPUs available for the computations.
+* Under [Compute estimates](#compute-estimates), all the estimates are computed using the different CV strategies.
+* Under [Results](#results) all the figures and tables reported in the manuscript are created.
+
+
+# Setup
+
+The code block allows tailoring the computation to the available resources on the local machine.
+
+```{r}
+#| label: user-config
+#| include: false
+N_CPUS <- 3
+```
+
+```{r}
+#| label: setup
+#| include: false
+library(tidyverse)
+library(pense)
+library(here)
+requireNamespace('cli')
+requireNamespace('gridExtra')
+requireNamespace('parallel')
+
+dev_pdf <- function (filename, width, height, .path = here("figures", "application-cav")) {
+  if (!dir.exists(.path)) {
+    dir.create(.path, mode = '0755', recursive = TRUE)
+  }
+  cairo_pdf(file.path(.path, str_remove(basename(filename), coll("-1"))),
+            fallback_resolution = 600,
+            antialias = 'default',
+            width = width,
+            height = height)
+}
+
+here::i_am("application_I-cav.qmd")
+knitr::opts_chunk$set(warning = FALSE,
+                      error = FALSE,
+                      message = FALSE,
+                      echo = FALSE,
+                      dev = c('png', 'dev_pdf'),
+                      fig.ext = c('png', 'pdf'),
+                      fig.align = 'center',
+                      out.width = '100%',
+                      fig.width = 7,
+                      fig.height = 3)
+
+source(here("90-compute-utils.R"))
+source(here("91-plotting-utils.R"))
+
+par_cluster <- parallel::makePSOCKcluster(N_CPUS)
+```
+
+```{r}
+#| label: cv-settings
+#| include: false
+CV_K <- 5
+CV_REPL <- 10
+EN_ALPHA <- 0.8
+PENSE_EXPLORE_IT <- 5
+PENSE_BDP <- 0.2
+RISCV_MAX_SOLUTIONS <- 50
+NLAMBDA <- 50
+ADAPENSE_RIDGE_MIN_LAMBDA_RATIO <- 1e-3
+ADAPENSE_MIN_LAMBDA_RATIO <- 5e-3
+```
+
+```{r}
+#| label: load-cav-data
+cav_x <- as.matrix(read.csv(here("data/cav/protein_levels_nona.csv")))
+cav_y <- read.csv(here("data/cav/response_nona.csv"))$response
+```
+
+# Compute estimates
+
+First we compute all the estimates with the different CV strategies (classical adaptive EN, adaptive PENSE with N-CV, adaptive PENSE with RIS-CV).
+
+## Classical EN
+
+Compute the classical adaptive EN estimate.
+
+```{r}
+#| label: cav-classical
+#| cache: true
+set.seed(123)
+cav_lsridge <- replicated_cv_glmnet(x = cav_x, 
+                                    y = cav_y,
+                                    alpha = 0,
+                                    type.measure = 'mae',
+                                    nfolds = CV_K,
+                                    lambda.min.ratio = 1e-3,
+                                    replications = CV_REPL,
+                                    nlambda = NLAMBDA)
+
+set.seed(123)
+cav_lsadaen <- replicated_cv_glmnet(x = cav_x, 
+                                    y = cav_y,
+                                    alpha = EN_ALPHA,
+                                    penalty.factor = 1 / abs(as.numeric(coef(cav_lsridge, s = 'lambda.min'))[-1]),
+                                    type.measure = 'mae',
+                                    nfolds = CV_K,
+                                    lambda.min.ratio = 1e-4,
+                                    replications = CV_REPL,
+                                    nlambda = NLAMBDA)
+```
+
+## Individual CV replications
+
+```{r}
+#| label: cav-ind-naive
+#| cache: true
+set.seed(123)
+cav_ind_naive <- lapply(1:2, \(i) {
+  stage_1 <- pense_cv(x = cav_x,
+                      y = cav_y,
+                      cv_type = 'naive',
+                      fold_starts = 'both',
+                      alpha = 0,
+                      bdp = PENSE_BDP,
+                      cv_k = CV_K,
+                      cv_repl = 1,
+                      nlambda = NLAMBDA,
+                      lambda_min_ratio = ADAPENSE_RIDGE_MIN_LAMBDA_RATIO,
+                      max_solutions = 1,
+                      explore_it = PENSE_EXPLORE_IT,
+                      cl = par_cluster)
+  
+  preliminary <- coef(stage_1, sparse = FALSE, concat = FALSE)$beta
+  
+  stage_2 <- pense_cv(x = cav_x,
+                      y = cav_y,
+                      cv_type = 'naive',
+                      fold_starts = 'both',
+                      penalty_loadings = 1 / abs(preliminary),
+                      alpha = EN_ALPHA,
+                      bdp = PENSE_BDP,
+                      cv_k = CV_K,
+                      cv_repl = 1,
+                      nlambda = NLAMBDA,
+                      lambda_min_ratio = ADAPENSE_MIN_LAMBDA_RATIO,
+                      max_solutions = 1,
+                      explore_it = PENSE_EXPLORE_IT,
+                      cl = par_cluster)
+  stage_2$preliminary <- stage_1
+  stage_2
+})
+```
+
+```{r}
+#| label: cav-ind-ris
+#| cache: true
+set.seed(123)
+cav_ind_ris <- lapply(1:2, \(i) {
+  stage_1 <- pense_cv(x = cav_x,
+                      y = cav_y,
+                      cv_type = 'ris',
+                      fold_starts = 'both',
+                      alpha = 0,
+                      bdp = PENSE_BDP,
+                      cv_k = CV_K,
+                      cv_repl = 1,
+                      nlambda = NLAMBDA,
+                      lambda_min_ratio = ADAPENSE_RIDGE_MIN_LAMBDA_RATIO,
+                      max_solutions = RISCV_MAX_SOLUTIONS,
+                      explore_it = PENSE_EXPLORE_IT,
+                      cl = par_cluster) |> 
+    change_cv_measure("wmape")
+  
+  preliminary <- coef(stage_1, sparse = FALSE, concat = FALSE)$beta
+  
+  stage_2 <- pense_cv(x = cav_x,
+                      y = cav_y,
+                      cv_type = 'ris',
+                      fold_starts = 'both',
+                      penalty_loadings = 1 / abs(preliminary),
+                      alpha = EN_ALPHA,
+                      bdp = PENSE_BDP,
+                      cv_k = CV_K,
+                      cv_repl = 1,
+                      nlambda = NLAMBDA,
+                      lambda_min_ratio = ADAPENSE_MIN_LAMBDA_RATIO,
+                      max_solutions = RISCV_MAX_SOLUTIONS,
+                      explore_it = PENSE_EXPLORE_IT,
+                      cl = par_cluster) |> 
+    change_cv_measure("wmape")
+  stage_2$preliminary <- stage_1
+  stage_2
+})
+```
+
+## Adaptive PENSE with N-CV
+
+```{r}
+#| label: cav-naive-ada-stage1
+#| cache: true
+set.seed(123)
+cav_ada_naive_cv_stage_1 <- pense_cv(x = cav_x,
+                                     y = cav_y,
+                                     cv_type = 'naive',
+                                     fold_starts = 'both',
+                                     alpha = 0,
+                                     bdp = PENSE_BDP,
+                                     cv_k = CV_K,
+                                     cv_repl = CV_REPL,
+                                     nlambda = NLAMBDA,
+                                     lambda_min_ratio = ADAPENSE_RIDGE_MIN_LAMBDA_RATIO,
+                                     max_solutions = 1,
+                                     explore_it = PENSE_EXPLORE_IT,
+                                     cl = par_cluster)
+```
+
+```{r}
+plot(cav_ada_naive_cv_stage_1)
+```
+
+```{r}
+#| label: cav-naive-ada
+#| cache: true
+set.seed(123)
+cav_ada_naive_cv <- pense_cv(x = cav_x,
+                             y = cav_y,
+                             cv_type = 'naive',
+                             fold_starts = 'both',
+                             penalty_loadings = 1 / abs(coef(cav_ada_naive_cv_stage_1,
+                                                             sparse = FALSE, concat = FALSE)$beta),
+                             alpha = EN_ALPHA,
+                             bdp = PENSE_BDP,
+                             cv_k = CV_K,
+                             cv_repl = CV_REPL,
+                             nlambda = NLAMBDA,
+                             lambda_min_ratio = ADAPENSE_MIN_LAMBDA_RATIO,
+                             max_solutions = 1,
+                             explore_it = PENSE_EXPLORE_IT,
+                             cl = par_cluster)
+```
+
+## Adaptive PENSE with RIS-CV
+
+```{r}
+#| label: cav-ris-ada-stage1
+#| cache: true
+set.seed(123)
+cav_ada_ris_cv_stage_1 <- pense_cv(x = cav_x,
+                                   y = cav_y,
+                                   cv_type = 'ris',
+                                   fold_starts = 'both',
+                                   alpha = 0,
+                                   bdp = PENSE_BDP,
+                                   cv_k = CV_K,
+                                   cv_repl = CV_REPL,
+                                   nlambda = NLAMBDA,
+                                   lambda_min_ratio = ADAPENSE_RIDGE_MIN_LAMBDA_RATIO,
+                                   explore_it = PENSE_EXPLORE_IT,
+                                   max_solutions = RISCV_MAX_SOLUTIONS,
+                                   cl = par_cluster)
+```
+
+```{r}
+#| label: cav-ris-ada
+#| cache: true
+set.seed(123)
+prelim <- cav_ada_ris_cv_stage_1 |> 
+  coef(sparse = FALSE, concat = FALSE)
+
+cav_ada_ris_cv <- pense_cv(x = cav_x,
+                           y = cav_y,
+                           penalty_loadings = 1 / abs(prelim$beta),
+                           cv_type = 'ris',
+                           fold_starts = 'both',
+                           alpha = EN_ALPHA,
+                           bdp = PENSE_BDP,
+                           cv_k = CV_K,
+                           cv_repl = CV_REPL,
+                           nlambda = NLAMBDA,
+                           lambda_min_ratio = ADAPENSE_MIN_LAMBDA_RATIO,
+                           explore_it = PENSE_EXPLORE_IT,
+                           max_solutions = RISCV_MAX_SOLUTIONS,
+                           cl = par_cluster)
+```
+
+# Results
+
+## Figure 2
+
+```{r}
+#| label: cav-plot-lsen-naive
+#| fig-height: 2.5
+#| fig-width: 5
+#| fig-cap: "Figure 2"
+lsen_pl <- with(cav_lsadaen,
+     tibble(cvavg = cvm,
+            cvse  = cvsd,
+            lambda = lambda,
+            method = "Adaptive LS-EN")) |> 
+  ggplot(aes(x = lambda, y = cvavg)) +
+  geom_point(size = 2, shape = 3, color = COLORPAL[['gray']]) +
+  geom_linerange(aes(ymin = cvavg - 1 * cvse, ymax = cvavg + 1 * cvse)) +
+  scale_x_log10(labels = log10_labeller()) +
+  plottheme() +
+  facet_wrap(~ method) +
+  labs(y = "MAPE",
+       x = expression(lambda))
+
+adapense_pl <- cav_ada_naive_cv$cvres |> 
+  select(lambda, cvavg, cvse) |> 
+  mutate(method = "Adaptive PENSE") |> 
+  ggplot(aes(x = lambda, y = cvavg)) +
+  geom_point(size = 2, shape = 1, color = COLORPAL[['green']]) +
+  geom_linerange(aes(ymin = cvavg - 1 * cvse, ymax = cvavg + 1 * cvse),
+                 color = COLORPAL[['green']]) +
+  scale_x_log10(labels = log10_labeller()) +
+  plottheme() +
+  facet_wrap(~ method) +
+  labs(y = expression(tau - "size of prediction errors"),
+       x = expression(lambda))
+
+gridExtra::grid.arrange(lsen_pl, adapense_pl, layout_matrix = matrix(1:2, nrow = 1))
+```
+
+## Figure 3
+
+```{r}
+#| label: cav-summary-plots
+#| fig-height: 4
+#| fig-width: 7
+#| eval: true
+#| fig-cap: "Figure 3"
+
+cav_ind <- list(naive = cav_ind_naive, ris = cav_ind_ris)
+
+cav_ada_ris_cv <- change_cv_measure(cav_ada_ris_cv, "wmape", max_solutions = 5)
+
+# The individual results may have different lambda grids, as the stage 1 estimate
+# can be different.
+# For plotting, we therefore use the lambda grid from the replicated estimate
+ind_cv_res <- cav_ind |> 
+  unlist(recursive = FALSE) |> 
+  map(\(x) {
+    change_cv_measure(x, "wmape", max_solutions = 5)$cvres |> 
+      select(lambda_index, value = cvavg)
+  }) |> 
+  list_rbind(names_to = 'id') |> 
+  mutate(id = str_replace(id, 'naive', 'N-CV ') |> 
+           str_replace('ris', 'RIS-CV ')) |> 
+  arrange(id, desc(lambda_index)) %>% 
+  mutate(cv_type = str_extract(id, '[\\w-]+'))
+
+
+cv_plts <- list(`N-CV` = cav_ada_naive_cv$cvres,
+                `RIS-CV` = cav_ada_ris_cv$cvres) |> 
+  list_rbind(names_to = 'cv_type') |> 
+  transmute(cv_type, 
+            lambda_index, 
+            value = cvavg, 
+            ymin = cvavg - cvse,
+            ymax = cvavg + cvse) |> 
+  mutate(panel = "Replicated CV",
+         id = cv_type) |> 
+  bind_rows(ind_cv_res |> 
+              mutate(panel = "Individual CV runs",
+                     ymin = value,
+                     ymax = value)) |> 
+  mutate(cv_type_lbl = case_match(cv_type,
+                                  "N-CV" ~ 'Naïve-CV',
+                                  "RIS-CV" ~ 'RIS-CV')) |> 
+  group_by(cv_type) |> 
+  group_map(.keep = TRUE, \(x, gr) {
+    ylbl <- switch(gr$cv_type[[1]],
+                   "N-CV"   = expression(paste(tau, "-size of prediction errors")),
+                   "RIS-CV" = expression(paste("Weighted MAPE of prediction errors")))
+    
+    tag <- switch(gr$cv_type[[1]],
+                   "N-CV"   = "(a)",
+                   "RIS-CV" = "(b)")
+    left_margin <- switch(gr$cv_type[[1]],
+                          "N-CV"   = 0.2,
+                          "RIS-CV" = 0.4)
+ 
+    x |> 
+      ggplot(aes(x = lambda_index, y = value, color = cv_type, group = id)) +
+      geom_line(aes(linetype = cv_type), linewidth = 0.5) +
+      geom_point(aes(shape = cv_type), size = 2) +
+      geom_linerange(aes(ymin = ymin, ymax = ymax)) +
+      scale_x_log10() +
+      scale_color_manual(values = c("N-CV" = COLORPAL[['green']],
+                                    "RIS-CV" = COLORPAL[['blue']]),
+                         guide = 'none') +
+      scale_linetype_manual(values = c("N-CV" = 'solid',
+                                       "RIS-CV" = '42'),
+                            guide = "none") +
+      scale_shape_manual(values = c("N-CV" = 1, "RIS-CV" = 16),
+                         guide = "none") +
+      scale_x_continuous(transform = 'reverse') +
+      facet_grid(cols = vars(cv_type_lbl), rows = vars(panel)) +
+      labs(x = expression(lambda - "index"),
+           y = ylbl,
+           tag = tag) +
+      plottheme() +
+      theme(plot.margin = margin(0.2, 0.4, 0.5, left_margin, 'lines'),
+            plot.tag.position = "bottom",
+            plot.tag = element_text(face = "bold", size = rel(0.8),
+                                    margin = margin(5, 0, 0, 0)))
+  })
+
+pen_path_plot <- plot_distances(`N-CV` = cav_ada_naive_cv,
+                                `RIS-CV` = cav_ada_ris_cv,
+                                x = "lambdaind",
+                                y = "l1norm",
+                                std_x = FALSE) +
+  labs(tag = "(c)") +
+  theme(plot.margin = margin(3, 0.4, 0.5, 0.2, 'lines'),
+        legend.position = 'top',
+        legend.background = element_rect(fill = '#ffffff', linewidth = 0.1),
+        legend.direction = "vertical",
+        plot.tag.position = "bottom",
+        plot.tag = element_text(face = "bold", size = rel(0.8),
+                                    margin = margin(5, 0, 0, 0)))
+
+layout <- matrix(nrow = 2, ncol = 100,
+                 byrow = TRUE,
+                 data = c(rep.int(1, 33), rep.int(2, 36), rep.int(3, 31),
+                          rep.int(1, 33), rep.int(2, 36), rep.int(3, 31)))
+
+gridExtra::grid.arrange(cv_plts[[1]], cv_plts[[2]], pen_path_plot,
+                        layout_matrix = layout)
+```

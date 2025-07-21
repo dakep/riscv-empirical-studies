@@ -1,0 +1,12 @@
+*.DS_Store
+.Rproj.user
+*.Rproj
+*_cache
+*_files
+.Rhistory
+*.rdx
+*.rdb
+*.rds
+*.dylib
+*.so
+*.o

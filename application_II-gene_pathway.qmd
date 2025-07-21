@@ -1,0 +1,409 @@
+---
+title: "Real-Data Application II: Gene Pathway Analysis"
+format:
+  html:
+    embed-resources: true
+    anchor-sections: true
+    theme:
+     - cosmo
+---
+
+# Summary
+
+This Quarto document reproduces all results and figures for the real-world application II (Gene Pathway Analysis) in the supplementary materials.
+**With 3 CPUs this code runs for about 3 hours.**
+The code below is configured to use 3 CPUs but it can be adjusted according to the local machine's available resources.
+
+The document is structured as follows:
+
+* Under [Setup](#Setup), the document properties are set for proper rendering of the results.
+  The user may choose to change the number of CPUs available for the computations.
+* Under [Compute estimates](#Compute-estimates), all the estimators are computed using the different CV strategies.
+* [Results](#results) contains all the code to reproduce the results and figures for the gene pathway analysis.
+
+The data is obtained from the paper at https://doi.org/10.1214/21-AOAS1487.
+
+# Setup
+
+The code block allows tailoring the computation to the available resources on the local machine.
+
+```{r}
+#| label: user-config
+#| include: false
+N_CPUS <- 3
+```
+
+```{r}
+#| label: setup
+#| include: false
+library(pense)
+library(here)
+requireNamespace('cli')
+
+dev_pdf <- function (filename, width, height, .path = here("figures", "application-pathway")) {
+  if (!dir.exists(.path)) {
+    dir.create(.path, mode = '0755', recursive = TRUE)
+  }
+  cairo_pdf(file.path(.path, str_remove(basename(filename), coll("-1"))),
+            fallback_resolution = 600,
+            antialias = 'default',
+            width = width,
+            height = height)
+}
+
+here::i_am("application_II-gene_pathway.qmd")
+knitr::opts_chunk$set(warning = FALSE,
+                      error = FALSE,
+                      message = FALSE,
+                      echo = FALSE,
+                      dev = c('png', 'dev_pdf'),
+                      fig.ext = c('png', 'pdf'),
+                      fig.align = 'center',
+                      out.width = '100%',
+                      fig.width = 7,
+                      fig.height = 3)
+
+source(here("90-compute-utils.R"))
+source(here("91-plotting-utils.R"))
+
+par_cluster <- parallel::makePSOCKcluster(N_CPUS)
+```
+
+```{r}
+#| label: cv-settings
+#| include: false
+CV_K <- 10
+CV_REPL <- 10
+EN_ALPHA <- 0.5
+PENSE_EXPLORE_IT <- 5
+PENSE_BDP <- 0.25
+RISCV_MAX_SOLUTIONS <- 50
+NLAMBDA <- 50
+PENSE_MIN_LAMBDA_RATIO <- 1e-4
+```
+
+```{r}
+#| label: pw-data-prep
+pathway_data <- new.env()
+load("data/pathway-analysis/pathway_info.Rda", envir = pathway_data)
+
+pathway_data$data <- read.csv("data/pathway-analysis/preprocessed_protein_data.csv")
+
+pathway_data$x_mat <- as.matrix(pathway_data$data[, -(1:2)])
+
+# Keep only variables on any of the 7 pathways
+pathway_data$x_mat_var <- pathway_data$x_mat[, unlist(pathway_data$pathway_info$pathway_list_prot)]
+
+# Generate response
+#' Generate from a centered Laplace distribution
+rlaplace <- function (n, sd = 1) {
+  sample(c(-1, 1), n, replace = TRUE) * rexp(n, rate = sqrt(2) / sd)
+}
+
+pathway_data$y <- vapply(pathway_data$pathway_info$pathway_list_prot,
+                         FUN.VALUE = numeric(nrow(pathway_data$x_mat)),
+                         FUN = \(pw_genes) {
+                           set.seed(123)
+                           genes <- which(colnames(pathway_data$x_mat_var) %in% pw_genes)
+                           y <- rowMeans(pathway_data$x_mat_var[, genes])
+                           # y + rnorm(length(y), sd = sd(y) / 1)
+                           y + rlaplace(length(y), sd = sd(y))
+                         })
+
+set.seed(123)
+train_ind <- sample.int(nrow(pathway_data$x_mat_var), 165)
+
+pw_train_x <- pathway_data$x_mat_var[train_ind, ]
+pw_test_x <- pathway_data$x_mat_var[-train_ind, ]
+# First 140 from PW 1, then 15 from PW 4
+pw_train_y <- c(pathway_data$y[train_ind[1:140], 1],
+                pathway_data$y[train_ind[141:165], 4])
+pw_test_y <- pathway_data$y[-train_ind, 1]
+```
+
+# Compute estimates
+
+## Classical EN
+
+```{r}
+#| label: pw-classical
+#| cache: true
+set.seed(123)
+pw_lsen <- replicated_cv_glmnet(x = pw_train_x, 
+                                y = pw_train_y,
+                                alpha = EN_ALPHA,
+                                type.measure = 'mae',
+                                nfolds = CV_K,
+                                lambda.min.ratio = 1e-3,
+                                replications = CV_REPL,
+                                nlambda = NLAMBDA)
+```
+
+## Individual CV replications
+
+```{r}
+#| label: pw-ind
+#| eval: false
+#| cache: true
+pw_ind <- list()
+set.seed(1)
+pw_ind$naive_a <- pense_cv(x = pw_train_x,
+                           y = pw_train_y,
+                           cv_type = 'naive',
+                           fold_starts = 'enpy',
+                           alpha = 0.5,
+                           bdp = 0.25,
+                           cv_k = 10,
+                           cv_repl = 1,
+                           nlambda = 50,
+                           lambda_min_ratio = 1e-4,
+                           explore_it = 5,
+                           max_solutions = 1,
+                           cl = par_cluster)
+set.seed(2)
+pw_ind$naive_b <- pense_cv(x = pw_train_x,
+                           y = pw_train_y,
+                           cv_type = 'naive',
+                           fold_starts = 'enpy',
+                           alpha = 0.5,
+                           bdp = 0.25,
+                           cv_k = 10,
+                           cv_repl = 1,
+                           nlambda = 50,
+                           lambda_min_ratio = 1e-4,
+                           explore_it = 5,
+                           max_solutions = 1,
+                           cl = par_cluster)
+```
+
+```{r}
+#| label: pr-ind-ris
+#| eval: false
+#| cache: true
+set.seed(1)
+pw_ind$ris_a <- pense_cv(x = pw_train_x,
+                         y = pw_train_y,
+                         cv_type = 'ris',
+                         alpha = 0.5,
+                         bdp = 0.25,
+                         cv_k = 10,
+                         cv_repl = 1,
+                         nlambda = 50,
+                         lambda_min_ratio = 1e-4,
+                         max_solutions = 40,
+                         explore_it = 5,
+                         cl = par_cluster)
+
+set.seed(2)
+pw_ind$ris_b <- pense_cv(x = pw_train_x,
+                         y = pw_train_y,
+                         cv_type = 'ris',
+                         alpha = 0.5,
+                         bdp = 0.25,
+                         cv_k = 10,
+                         cv_repl = 1,
+                         nlambda = 50,
+                         lambda_min_ratio = 1e-4,
+                         max_solutions = 40,
+                         explore_it = 5,
+                         cl = par_cluster)
+```
+
+## PENSE with N-CV
+
+```{r}
+#| label: pw-naive
+#| cache: true
+set.seed(123)
+pw_naive_cv <- pense_cv(x = pw_train_x,
+                        y = pw_train_y,
+                        cv_type = 'naive',
+                        fold_starts = 'full',
+                        alpha = EN_ALPHA,
+                        bdp = PENSE_BDP,
+                        cv_k = CV_K,
+                        cv_repl = CV_REPL,
+                        nlambda = NLAMBDA,
+                        lambda_min_ratio = PENSE_MIN_LAMBDA_RATIO,
+                        max_solutions = 1,
+                        explore_it = PENSE_EXPLORE_IT,
+                        cl = par_cluster)
+```
+
+## PENSE with RIS-CV
+
+```{r}
+#| label: pw-ris
+#| cache: true
+set.seed(123)
+pw_ris_cv <- pense_cv(x = pw_train_x,
+                      y = pw_train_y,
+                      cv_type = 'ris',
+                      fold_starts = 'full',
+                      alpha = EN_ALPHA,
+                      bdp = PENSE_BDP,
+                      cv_k = CV_K,
+                      cv_repl = CV_REPL,
+                      nlambda = NLAMBDA,
+                      lambda_min_ratio = PENSE_MIN_LAMBDA_RATIO,
+                      explore_it = PENSE_EXPLORE_IT,
+                      max_solutions = RISCV_MAX_SOLUTIONS,
+                      cl = par_cluster)
+```
+
+
+# Results
+
+## Figure S1
+
+```{r}
+#| label: pw-summary-plots
+#| fig-height: 2.5
+#| fig-width: 7
+#| eval: true
+#| fig-cap: "Figure S2"
+
+pw_ris_cv <- change_cv_measure(pw_ris_cv, "wmape")
+
+pw_lsen_oos_error <- sweep(pw_test_x %*% pw_lsen$glmnet.fit$beta, 2L,  pw_lsen$glmnet.fit$a0, "-") |> 
+  abs() |> 
+  colMeans()
+
+pw_lsen_cvres <- tibble(cvavg = pw_lsen$cvm,
+                        cvse  = pw_lsen$cvsd,
+                        oos_error = pw_lsen_oos_error,
+                        lambda_index = order(pw_lsen$lambda, decreasing = TRUE),
+                        cv_type = "LS-EN",
+                        id      = "LS-EN",
+                        panel = "Replicated CV") |> 
+  mutate(cvsel = pense:::.cv_se_selection(cvavg, cvse, 1)) |> 
+  pivot_longer(c(cvavg, oos_error)) |> 
+  mutate(cvse = if_else(name == 'oos_error', 0, cvse),
+         id = if_else(name == 'oos_error', 'OOS Error', cv_type),
+         ymin = value - cvse,
+         ymax = value + cvse) |> 
+  select(-name, -cvse)
+
+cv_plots <- list(`N-CV`   = pw_naive_cv,
+                 `RIS-CV` = pw_ris_cv) |> 
+  map(\(x) {
+    oos_rmspe <- map2_dbl(x$cvres$lambda_index, x$cvres$solution_index, \(li, si) {
+      est <- x$estimates[[li]][[si]]
+      mean(abs(pw_test_y - drop(pw_test_x %*% est$beta) - est$intercept))
+    })
+    x$cvres$oos_error <- oos_rmspe
+    x$cvres |> 
+      mutate(cvsel = pense:::.cv_se_selection(cvavg, cvse, 1)) |> 
+      select(lambda_index, cvsel, cvavg, cvse, oos_error) |> 
+      pivot_longer(c(cvavg, oos_error)) |> 
+      mutate(cvse  = if_else(name == 'oos_error', 0, cvse))
+  }) |> 
+  list_rbind(names_to = 'cv_type') |> 
+  transmute(cv_type, 
+            id = if_else(name == 'oos_error', 'OOS Error', cv_type),
+            lambda_index,
+            cvsel,
+            value = if_else(name == 'cvavg' & cv_type == 'RIS-CV',
+                            value, value),
+            ymin  = value - cvse,
+            ymax  = value + cvse) |> 
+  mutate(panel = "Replicated CV") |> 
+  bind_rows(pw_lsen_cvres) |> 
+  mutate(cv_type_lbl = case_match(cv_type,
+                                  "N-CV"   ~ 'Naïve-CV',
+                                  .default = cv_type)) |> 
+  group_by(cv_type) |> 
+  group_map(.keep = TRUE, \(x, gr) {
+    ylbl <- switch(gr$cv_type[[1]],
+                   "N-CV"   = expression(paste(tau, "-size of prediction errors")),
+                   "LS-EN"   = expression(paste("Mean absolute prediction error")),
+                   "RIS-CV" = expression(paste("Weighted MAPE")))
+    
+    tag <- switch(gr$cv_type[[1]],
+                  "LS-EN"  = "(a)",
+                  "N-CV"   = "(b)",
+                  "RIS-CV" = "(c)")
+
+    left_margin <- switch(gr$cv_type[[1]],
+                          "N-CV"   = 0.4,
+                          "RIS-CV" = 0.4,
+                          "LS-EN"  = 0.2)
+    ylim <- switch(gr$cv_type[[1]],
+                   "LS-EN" = c(0.2, 10),
+                   c(0.2, .5))
+    
+    selection <- x |> 
+      filter(cvsel == 'se_fact', id != 'OOS Error') |> 
+      pull(lambda_index)
+
+    gd <- guide_none()
+
+    x |> 
+      mutate(cv_type = if_else(id == 'OOS Error', 'OOS Error', cv_type)) |> 
+      ggplot(aes(x = lambda_index, y = value, color = cv_type, group = id)) +
+      geom_line(aes(linetype = cv_type), linewidth = 0.5) +
+      geom_point(aes(shape = cv_type), size = 2) +
+      geom_linerange(aes(ymin = ymin, ymax = ymax)) +
+      geom_vline(xintercept = selection, linetype = '22', color = 'black', linewidth = 0.5) +
+      scale_x_log10() +
+      scale_color_manual(values = c("N-CV"      = COLORPAL[['green']],
+                                    "RIS-CV"    = COLORPAL[['blue']],
+                                    "LS-EN"     = COLORPAL[['magenta']],
+                                    "OOS Error" = COLORPAL[['gray']]),
+                         guide = gd) +
+      scale_linetype_manual(values = c("N-CV"      = 'solid',
+                                       "RIS-CV"    = '42',
+                                       "LS-EN"     = '2242',
+                                       "OOS Error" = '11'),
+                            guide = gd) +
+      scale_shape_manual(values = c("N-CV"      = 1, 
+                                    "RIS-CV"    = 16,
+                                    "LS-EN"     = 18,
+                                    "OOS Error" = 22),
+                         guide = gd) +
+      scale_x_continuous(transform = 'reverse') +
+      facet_grid(cols = vars(cv_type_lbl)) +
+      labs(x = expression(lambda - "index"),
+           y = ylbl,
+           tag = tag) +
+      coord_cartesian(ylim = ylim) +
+      plottheme() +
+      theme(plot.margin = margin(0.2, 0.4, 0.5, left_margin, 'lines'),
+            plot.tag.position = "bottom",
+            plot.tag = element_text(face = "bold", size = rel(0.8),
+                                    margin = margin(5, 0, 0, 0)),
+            legend.position = 'inside',
+            legend.position.inside = c(0.8, 0.8))
+  })
+
+
+layout <- matrix(nrow = 1, ncol = 100,
+                 byrow = TRUE,
+                 data = c(rep.int(1, 32), rep.int(2, 34), rep.int(3, 34)))
+
+gridExtra::grid.arrange(grobs = cv_plots, layout_matrix = layout)
+```
+
+```{r}
+mean(abs(pw_test_y - predict(pw_naive_cv, lambda = 'se', pw_test_x)))
+mean(abs(pw_test_y - predict(pw_ris_cv, lambda = 'se', pw_test_x)))
+```
+
+
+## Figure S2
+
+```{r}
+#| label: pw-regularization-path
+#| fig-height: 2.5
+#| fig-width: 4
+#| eval: true
+plot_distances(`N-CV`   = pw_naive_cv,
+               `RIS-CV` = pw_ris_cv,
+               x = "lambdaind",
+               y = "l1norm",
+               std_x = FALSE) +
+  theme(legend.position = 'inside',
+        legend.position.inside = c(0.8, 0.9))
+```
+
+
