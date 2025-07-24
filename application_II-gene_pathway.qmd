@@ -70,6 +70,28 @@ par_cluster <- parallel::makePSOCKcluster(N_CPUS)
 ```
 
 ```{r}
+#| label: check-pense-version
+# Check if the pense package is available on all nodes in the cluster
+pense_pkg_version_errors <- parallel::clusterEvalQ(par_cluster, {
+  pkg_info <- tryCatch(library(help = "pense"), error = \(cnd) NULL)
+  if (is.null(pkg_info)) {
+    paste0("pense package unavailable in .libPaths():\n\t", paste(.libPaths(), collapse = "\n\t"), "\n")
+  } else if ((pkg_version <- packageVersion("pense", lib.loc = dirname(pkg_info$path))) < '2.5.0') {
+    sprintf("Incorrect pense package version (%s < '2.5.0') loaded from %s\n", as.character(pkg_version), pkg_info$path)
+  } else {
+  	""
+  }
+}) |>
+  unlist(FALSE, FALSE) |>
+  unique() |>
+	paste0(collapse = "\n")
+
+if (isTRUE(nzchar(pense_pkg_version_errors))) {
+  stop(pense_pkg_version_errors)
+}
+```
+
+```{r}
 #| label: cv-settings
 #| include: false
 CV_K <- 10
@@ -127,9 +149,9 @@ pw_test_y <- pathway_data$y[-train_ind, 1]
 
 ```{r}
 #| label: pw-classical
-#| cache: true
+#| cache: false
 set.seed(123)
-pw_lsen <- replicated_cv_glmnet(x = pw_train_x, 
+pw_lsen <- replicated_cv_glmnet(x = pw_train_x,
                                 y = pw_train_y,
                                 alpha = EN_ALPHA,
                                 type.measure = 'mae',
@@ -144,7 +166,7 @@ pw_lsen <- replicated_cv_glmnet(x = pw_train_x,
 ```{r}
 #| label: pw-ind
 #| eval: false
-#| cache: true
+#| cache: false
 pw_ind <- list()
 set.seed(1)
 pw_ind$naive_a <- pense_cv(x = pw_train_x,
@@ -179,7 +201,7 @@ pw_ind$naive_b <- pense_cv(x = pw_train_x,
 ```{r}
 #| label: pr-ind-ris
 #| eval: false
-#| cache: true
+#| cache: false
 set.seed(1)
 pw_ind$ris_a <- pense_cv(x = pw_train_x,
                          y = pw_train_y,
@@ -213,7 +235,7 @@ pw_ind$ris_b <- pense_cv(x = pw_train_x,
 
 ```{r}
 #| label: pw-naive
-#| cache: true
+#| cache: false
 set.seed(123)
 pw_naive_cv <- pense_cv(x = pw_train_x,
                         y = pw_train_y,
@@ -234,7 +256,7 @@ pw_naive_cv <- pense_cv(x = pw_train_x,
 
 ```{r}
 #| label: pw-ris
-#| cache: true
+#| cache: false
 set.seed(123)
 pw_ris_cv <- pense_cv(x = pw_train_x,
                       y = pw_train_y,
@@ -265,8 +287,8 @@ pw_ris_cv <- pense_cv(x = pw_train_x,
 
 pw_ris_cv <- change_cv_measure(pw_ris_cv, "wmape")
 
-pw_lsen_oos_error <- sweep(pw_test_x %*% pw_lsen$glmnet.fit$beta, 2L,  pw_lsen$glmnet.fit$a0, "-") |> 
-  abs() |> 
+pw_lsen_oos_error <- sweep(pw_test_x %*% pw_lsen$glmnet.fit$beta, 2L,  pw_lsen$glmnet.fit$a0, "-") |>
+  abs() |>
   colMeans()
 
 pw_lsen_cvres <- tibble(cvavg = pw_lsen$cvm,
@@ -275,50 +297,50 @@ pw_lsen_cvres <- tibble(cvavg = pw_lsen$cvm,
                         lambda_index = order(pw_lsen$lambda, decreasing = TRUE),
                         cv_type = "LS-EN",
                         id      = "LS-EN",
-                        panel = "Replicated CV") |> 
-  mutate(cvsel = pense:::.cv_se_selection(cvavg, cvse, 1)) |> 
-  pivot_longer(c(cvavg, oos_error)) |> 
+                        panel = "Replicated CV") |>
+  mutate(cvsel = pense:::.cv_se_selection(cvavg, cvse, 1)) |>
+  pivot_longer(c(cvavg, oos_error)) |>
   mutate(cvse = if_else(name == 'oos_error', 0, cvse),
          id = if_else(name == 'oos_error', 'OOS Error', cv_type),
          ymin = value - cvse,
-         ymax = value + cvse) |> 
+         ymax = value + cvse) |>
   select(-name, -cvse)
 
 cv_plots <- list(`N-CV`   = pw_naive_cv,
-                 `RIS-CV` = pw_ris_cv) |> 
+                 `RIS-CV` = pw_ris_cv) |>
   map(\(x) {
     oos_rmspe <- map2_dbl(x$cvres$lambda_index, x$cvres$solution_index, \(li, si) {
       est <- x$estimates[[li]][[si]]
       mean(abs(pw_test_y - drop(pw_test_x %*% est$beta) - est$intercept))
     })
     x$cvres$oos_error <- oos_rmspe
-    x$cvres |> 
-      mutate(cvsel = pense:::.cv_se_selection(cvavg, cvse, 1)) |> 
-      select(lambda_index, cvsel, cvavg, cvse, oos_error) |> 
-      pivot_longer(c(cvavg, oos_error)) |> 
+    x$cvres |>
+      mutate(cvsel = pense:::.cv_se_selection(cvavg, cvse, 1)) |>
+      select(lambda_index, cvsel, cvavg, cvse, oos_error) |>
+      pivot_longer(c(cvavg, oos_error)) |>
       mutate(cvse  = if_else(name == 'oos_error', 0, cvse))
-  }) |> 
-  list_rbind(names_to = 'cv_type') |> 
-  transmute(cv_type, 
+  }) |>
+  list_rbind(names_to = 'cv_type') |>
+  transmute(cv_type,
             id = if_else(name == 'oos_error', 'OOS Error', cv_type),
             lambda_index,
             cvsel,
             value = if_else(name == 'cvavg' & cv_type == 'RIS-CV',
                             value, value),
             ymin  = value - cvse,
-            ymax  = value + cvse) |> 
-  mutate(panel = "Replicated CV") |> 
-  bind_rows(pw_lsen_cvres) |> 
+            ymax  = value + cvse) |>
+  mutate(panel = "Replicated CV") |>
+  bind_rows(pw_lsen_cvres) |>
   mutate(cv_type_lbl = case_match(cv_type,
                                   "N-CV"   ~ 'Naïve-CV',
-                                  .default = cv_type)) |> 
-  group_by(cv_type) |> 
+                                  .default = cv_type)) |>
+  group_by(cv_type) |>
   group_map(.keep = TRUE, \(x, gr) {
     ylbl <- switch(gr$cv_type[[1]],
                    "N-CV"   = expression(paste(tau, "-size of prediction errors")),
                    "LS-EN"   = expression(paste("Mean absolute prediction error")),
                    "RIS-CV" = expression(paste("Weighted MAPE")))
-    
+
     tag <- switch(gr$cv_type[[1]],
                   "LS-EN"  = "(a)",
                   "N-CV"   = "(b)",
@@ -331,15 +353,15 @@ cv_plots <- list(`N-CV`   = pw_naive_cv,
     ylim <- switch(gr$cv_type[[1]],
                    "LS-EN" = c(0.2, 10),
                    c(0.2, .5))
-    
-    selection <- x |> 
-      filter(cvsel == 'se_fact', id != 'OOS Error') |> 
+
+    selection <- x |>
+      filter(cvsel == 'se_fact', id != 'OOS Error') |>
       pull(lambda_index)
 
     gd <- guide_none()
 
-    x |> 
-      mutate(cv_type = if_else(id == 'OOS Error', 'OOS Error', cv_type)) |> 
+    x |>
+      mutate(cv_type = if_else(id == 'OOS Error', 'OOS Error', cv_type)) |>
       ggplot(aes(x = lambda_index, y = value, color = cv_type, group = id)) +
       geom_line(aes(linetype = cv_type), linewidth = 0.5) +
       geom_point(aes(shape = cv_type), size = 2) +
@@ -356,7 +378,7 @@ cv_plots <- list(`N-CV`   = pw_naive_cv,
                                        "LS-EN"     = '2242',
                                        "OOS Error" = '11'),
                             guide = gd) +
-      scale_shape_manual(values = c("N-CV"      = 1, 
+      scale_shape_manual(values = c("N-CV"      = 1,
                                     "RIS-CV"    = 16,
                                     "LS-EN"     = 18,
                                     "OOS Error" = 22),

@@ -23,10 +23,25 @@ These scripts and markdown files reproduce the figures/tables for the applicatio
 
 ### Manual Setup
 
-To run the R code it is necessary to install the following R packages from CRAN:
+**It is recommended to first delete all other versions of the pense package:**
 
 ```r
 # R code
+lapply(.libPaths(), \(lib) {
+  if (length(find.package("pense", lib.loc = lib, quiet = TRUE)) > 0L) {
+    remove.packages("pense", lib = lib)
+    paste0("Removed from ", lib)
+  } else {
+    paste0("Not installed in ", lib)
+  }
+})
+```
+
+To run the R code it is necessary to install the following R packages from CRAN (step 1) and then install the copy of the pense package from the `pense/` folder (step 2).
+
+```r
+# R code
+# Step 1
 install.packages(c("tidyverse",
                    "argparser",
                    "glmnet",
@@ -42,15 +57,12 @@ install.packages(c("tidyverse",
                    "robustbase",
                    "stabledist",
                    "remotes"))
-```
 
-Afterwards, the **pense** package from the `pense/` folder must be installed.
-A working C++17 toolchain is required to install this R package:
-
-```r
-# R code
 remotes::install_local("./pense")
 ```
+
+Please note that a working C++17 toolchain is required to install the pense package.
+
 
 ### Alternative: `renv`
 

@@ -74,6 +74,28 @@ par_cluster <- parallel::makePSOCKcluster(N_CPUS)
 ```
 
 ```{r}
+#| label: check-pense-version
+# Check if the pense package is available on all nodes in the cluster
+pense_pkg_version_errors <- parallel::clusterEvalQ(par_cluster, {
+  pkg_info <- tryCatch(library(help = "pense"), error = \(cnd) NULL)
+  if (is.null(pkg_info)) {
+    paste0("pense package unavailable in .libPaths():\n\t", paste(.libPaths(), collapse = "\n\t"), "\n")
+  } else if ((pkg_version <- packageVersion("pense", lib.loc = dirname(pkg_info$path))) < '2.5.0') {
+    sprintf("Incorrect pense package version (%s < '2.5.0') loaded from %s\n", as.character(pkg_version), pkg_info$path)
+  } else {
+  	""
+  }
+}) |>
+  unlist(FALSE, FALSE) |>
+  unique() |>
+	paste0(collapse = "\n")
+
+if (isTRUE(nzchar(pense_pkg_version_errors))) {
+  stop(pense_pkg_version_errors)
+}
+```
+
+```{r}
 #| label: cv-settings
 #| include: false
 CV_K <- 10
@@ -116,9 +138,9 @@ pr_test_y <- as.double(pr$BETAPLASMA[-pr_train_indices])
 
 ```{r}
 #| label: plasma-classical
-#| cache: true
+#| cache: false
 set.seed(123)
-pr_lsen <- replicated_cv_glmnet(x = pr_train_x, 
+pr_lsen <- replicated_cv_glmnet(x = pr_train_x,
                                 y = pr_train_y,
                                 alpha = EN_ALPHA,
                                 type.measure = 'mae',
@@ -133,7 +155,7 @@ pr_lsen <- replicated_cv_glmnet(x = pr_train_x,
 ```{r}
 #| label: plasma-ind-naive
 #| eval: false
-#| cache: true
+#| cache: false
 
 set.seed(1)
 pr_ind_naive <- lapply(1:2, \(.) {
@@ -156,7 +178,7 @@ pr_ind_naive <- lapply(1:2, \(.) {
 ```{r}
 #| label: plasma-ind-ris
 #| eval: false
-#| cache: true
+#| cache: false
 
 set.seed(1)
 
@@ -183,7 +205,7 @@ pr_ind_ris <- lapply(1:2, \(.) {
 
 ```{r}
 #| label: plasma-naive
-#| cache: true
+#| cache: false
 set.seed(123)
 pr_naive_cv <- pense_cv(x = pr_train_x,
                         y = pr_train_y,
@@ -204,7 +226,7 @@ pr_naive_cv <- pense_cv(x = pr_train_x,
 
 ```{r}
 #| label: plasma-ris
-#| cache: true
+#| cache: false
 pr_ris_cv <- pense_cv(x = pr_train_x,
                       y = pr_train_y,
                       cv_type = 'ris',
@@ -233,8 +255,8 @@ pr_ris_cv <- pense_cv(x = pr_train_x,
 
 pr_ris_cv <- change_cv_measure(pr_ris_cv, "wrmspe")
 
-pr_lsen_oos_error <- sweep(pr_test_x %*% pr_lsen$glmnet.fit$beta, 2L,  pr_lsen$glmnet.fit$a0, "-") |> 
-  abs() |> 
+pr_lsen_oos_error <- sweep(pr_test_x %*% pr_lsen$glmnet.fit$beta, 2L,  pr_lsen$glmnet.fit$a0, "-") |>
+  abs() |>
   colMeans()
 
 pr_lsen_cvres <- tibble(cvavg = pr_lsen$cvm,
@@ -243,50 +265,50 @@ pr_lsen_cvres <- tibble(cvavg = pr_lsen$cvm,
                         lambda_index = order(pr_lsen$lambda, decreasing = TRUE),
                         cv_type = "LS-EN",
                         id      = "LS-EN",
-                        panel = "Replicated CV") |> 
-  mutate(cvsel = pense:::.cv_se_selection(cvavg, cvse, 1)) |> 
-  pivot_longer(c(cvavg, oos_error)) |> 
+                        panel = "Replicated CV") |>
+  mutate(cvsel = pense:::.cv_se_selection(cvavg, cvse, 1)) |>
+  pivot_longer(c(cvavg, oos_error)) |>
   mutate(cvse = if_else(name == 'oos_error', 0, cvse),
          id = if_else(name == 'oos_error', 'OOS Error', cv_type),
          ymin = value - cvse,
-         ymax = value + cvse) |> 
+         ymax = value + cvse) |>
   select(-name, -cvse)
 
 cv_plots <- list(`N-CV`   = pr_naive_cv,
-                 `RIS-CV` = pr_ris_cv) |> 
+                 `RIS-CV` = pr_ris_cv) |>
   map(\(x) {
     oos_rmspe <- map2_dbl(x$cvres$lambda_index, x$cvres$solution_index, \(li, si) {
       est <- x$estimates[[li]][[si]]
       mean(abs(pr_test_y - drop(pr_test_x %*% est$beta) - est$intercept))
     })
     x$cvres$oos_error <- oos_rmspe
-    x$cvres |> 
-      mutate(cvsel = pense:::.cv_se_selection(cvavg, cvse, 1)) |> 
-      select(lambda_index, cvsel, cvavg, cvse, oos_error) |> 
-      pivot_longer(c(cvavg, oos_error)) |> 
+    x$cvres |>
+      mutate(cvsel = pense:::.cv_se_selection(cvavg, cvse, 1)) |>
+      select(lambda_index, cvsel, cvavg, cvse, oos_error) |>
+      pivot_longer(c(cvavg, oos_error)) |>
       mutate(cvse  = if_else(name == 'oos_error', 0, cvse))
-  }) |> 
-  list_rbind(names_to = 'cv_type') |> 
-  transmute(cv_type, 
+  }) |>
+  list_rbind(names_to = 'cv_type') |>
+  transmute(cv_type,
             id = if_else(name == 'oos_error', 'OOS Error', cv_type),
             lambda_index,
             cvsel,
             value = if_else(name == 'cvavg' & cv_type == 'RIS-CV',
                             1.3 * value, value),
             ymin  = value - cvse,
-            ymax  = value + cvse) |> 
-  mutate(panel = "Replicated CV") |> 
-  bind_rows(pr_lsen_cvres) |> 
+            ymax  = value + cvse) |>
+  mutate(panel = "Replicated CV") |>
+  bind_rows(pr_lsen_cvres) |>
   mutate(cv_type_lbl = case_match(cv_type,
                                   "N-CV"   ~ 'Naïve-CV',
-                                  .default = cv_type)) |> 
-  group_by(cv_type) |> 
+                                  .default = cv_type)) |>
+  group_by(cv_type) |>
   group_map(.keep = TRUE, \(x, gr) {
     ylbl <- switch(gr$cv_type[[1]],
                    "N-CV"   = expression(paste(tau, "-size of prediction errors")),
                    "LS-EN"   = expression(paste("Mean absolute prediction error")),
                    "RIS-CV" = expression(paste("Weighted RMSPE")))
-    
+
     tag <- switch(gr$cv_type[[1]],
                   "LS-EN"  = "(a)",
                   "N-CV"   = "(b)",
@@ -296,15 +318,15 @@ cv_plots <- list(`N-CV`   = pr_naive_cv,
                           "N-CV"   = 0.4,
                           "RIS-CV" = 0.4,
                           "LS-EN"  = 0.2)
-    
-    selection <- x |> 
-      filter(cvsel == 'se_fact', id != 'OOS Error') |> 
+
+    selection <- x |>
+      filter(cvsel == 'se_fact', id != 'OOS Error') |>
       pull(lambda_index)
 
     gd <- guide_none()
 
-    x |> 
-      mutate(cv_type = if_else(id == 'OOS Error', 'OOS Error', cv_type)) |> 
+    x |>
+      mutate(cv_type = if_else(id == 'OOS Error', 'OOS Error', cv_type)) |>
       ggplot(aes(x = lambda_index, y = value, color = cv_type, group = id)) +
       geom_line(aes(linetype = cv_type), linewidth = 0.5) +
       geom_point(aes(shape = cv_type), size = 2) +
@@ -321,7 +343,7 @@ cv_plots <- list(`N-CV`   = pr_naive_cv,
                                        "LS-EN"     = '2242',
                                        "OOS Error" = '11'),
                             guide = gd) +
-      scale_shape_manual(values = c("N-CV"      = 1, 
+      scale_shape_manual(values = c("N-CV"      = 1,
                                     "RIS-CV"    = 16,
                                     "LS-EN"     = 18,
                                     "OOS Error" = 22),

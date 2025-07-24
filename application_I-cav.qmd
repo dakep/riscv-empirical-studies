@@ -72,6 +72,28 @@ par_cluster <- parallel::makePSOCKcluster(N_CPUS)
 ```
 
 ```{r}
+#| label: check-pense-version
+# Check if the pense package is available on all nodes in the cluster
+pense_pkg_version_errors <- parallel::clusterEvalQ(par_cluster, {
+  pkg_info <- tryCatch(library(help = "pense"), error = \(cnd) NULL)
+  if (is.null(pkg_info)) {
+    paste0("pense package unavailable in .libPaths():\n\t", paste(.libPaths(), collapse = "\n\t"), "\n")
+  } else if ((pkg_version <- packageVersion("pense", lib.loc = dirname(pkg_info$path))) < '2.5.0') {
+    sprintf("Incorrect pense package version (%s < '2.5.0') loaded from %s\n", as.character(pkg_version), pkg_info$path)
+  } else {
+  	""
+  }
+}) |>
+  unlist(FALSE, FALSE) |>
+  unique() |>
+	paste0(collapse = "\n")
+
+if (isTRUE(nzchar(pense_pkg_version_errors))) {
+  stop(pense_pkg_version_errors)
+}
+```
+
+```{r}
 #| label: cv-settings
 #| include: false
 CV_K <- 5
@@ -101,9 +123,9 @@ Compute the classical adaptive EN estimate.
 
 ```{r}
 #| label: cav-classical
-#| cache: true
+#| cache: false
 set.seed(123)
-cav_lsridge <- replicated_cv_glmnet(x = cav_x, 
+cav_lsridge <- replicated_cv_glmnet(x = cav_x,
                                     y = cav_y,
                                     alpha = 0,
                                     type.measure = 'mae',
@@ -113,7 +135,7 @@ cav_lsridge <- replicated_cv_glmnet(x = cav_x,
                                     nlambda = NLAMBDA)
 
 set.seed(123)
-cav_lsadaen <- replicated_cv_glmnet(x = cav_x, 
+cav_lsadaen <- replicated_cv_glmnet(x = cav_x,
                                     y = cav_y,
                                     alpha = EN_ALPHA,
                                     penalty.factor = 1 / abs(as.numeric(coef(cav_lsridge, s = 'lambda.min'))[-1]),
@@ -128,7 +150,7 @@ cav_lsadaen <- replicated_cv_glmnet(x = cav_x,
 
 ```{r}
 #| label: cav-ind-naive
-#| cache: true
+#| cache: false
 set.seed(123)
 cav_ind_naive <- lapply(1:2, \(i) {
   stage_1 <- pense_cv(x = cav_x,
@@ -144,9 +166,9 @@ cav_ind_naive <- lapply(1:2, \(i) {
                       max_solutions = 1,
                       explore_it = PENSE_EXPLORE_IT,
                       cl = par_cluster)
-  
+
   preliminary <- coef(stage_1, sparse = FALSE, concat = FALSE)$beta
-  
+
   stage_2 <- pense_cv(x = cav_x,
                       y = cav_y,
                       cv_type = 'naive',
@@ -168,7 +190,7 @@ cav_ind_naive <- lapply(1:2, \(i) {
 
 ```{r}
 #| label: cav-ind-ris
-#| cache: true
+#| cache: false
 set.seed(123)
 cav_ind_ris <- lapply(1:2, \(i) {
   stage_1 <- pense_cv(x = cav_x,
@@ -183,11 +205,11 @@ cav_ind_ris <- lapply(1:2, \(i) {
                       lambda_min_ratio = ADAPENSE_RIDGE_MIN_LAMBDA_RATIO,
                       max_solutions = RISCV_MAX_SOLUTIONS,
                       explore_it = PENSE_EXPLORE_IT,
-                      cl = par_cluster) |> 
+                      cl = par_cluster) |>
     change_cv_measure("wmape")
-  
+
   preliminary <- coef(stage_1, sparse = FALSE, concat = FALSE)$beta
-  
+
   stage_2 <- pense_cv(x = cav_x,
                       y = cav_y,
                       cv_type = 'ris',
@@ -201,7 +223,7 @@ cav_ind_ris <- lapply(1:2, \(i) {
                       lambda_min_ratio = ADAPENSE_MIN_LAMBDA_RATIO,
                       max_solutions = RISCV_MAX_SOLUTIONS,
                       explore_it = PENSE_EXPLORE_IT,
-                      cl = par_cluster) |> 
+                      cl = par_cluster) |>
     change_cv_measure("wmape")
   stage_2$preliminary <- stage_1
   stage_2
@@ -212,7 +234,7 @@ cav_ind_ris <- lapply(1:2, \(i) {
 
 ```{r}
 #| label: cav-naive-ada-stage1
-#| cache: true
+#| cache: false
 set.seed(123)
 cav_ada_naive_cv_stage_1 <- pense_cv(x = cav_x,
                                      y = cav_y,
@@ -235,7 +257,7 @@ plot(cav_ada_naive_cv_stage_1)
 
 ```{r}
 #| label: cav-naive-ada
-#| cache: true
+#| cache: false
 set.seed(123)
 cav_ada_naive_cv <- pense_cv(x = cav_x,
                              y = cav_y,
@@ -258,7 +280,7 @@ cav_ada_naive_cv <- pense_cv(x = cav_x,
 
 ```{r}
 #| label: cav-ris-ada-stage1
-#| cache: true
+#| cache: false
 set.seed(123)
 cav_ada_ris_cv_stage_1 <- pense_cv(x = cav_x,
                                    y = cav_y,
@@ -277,9 +299,9 @@ cav_ada_ris_cv_stage_1 <- pense_cv(x = cav_x,
 
 ```{r}
 #| label: cav-ris-ada
-#| cache: true
+#| cache: false
 set.seed(123)
-prelim <- cav_ada_ris_cv_stage_1 |> 
+prelim <- cav_ada_ris_cv_stage_1 |>
   coef(sparse = FALSE, concat = FALSE)
 
 cav_ada_ris_cv <- pense_cv(x = cav_x,
@@ -311,7 +333,7 @@ lsen_pl <- with(cav_lsadaen,
      tibble(cvavg = cvm,
             cvse  = cvsd,
             lambda = lambda,
-            method = "Adaptive LS-EN")) |> 
+            method = "Adaptive LS-EN")) |>
   ggplot(aes(x = lambda, y = cvavg)) +
   geom_point(size = 2, shape = 3, color = COLORPAL[['gray']]) +
   geom_linerange(aes(ymin = cvavg - 1 * cvse, ymax = cvavg + 1 * cvse)) +
@@ -321,9 +343,9 @@ lsen_pl <- with(cav_lsadaen,
   labs(y = "MAPE",
        x = expression(lambda))
 
-adapense_pl <- cav_ada_naive_cv$cvres |> 
-  select(lambda, cvavg, cvse) |> 
-  mutate(method = "Adaptive PENSE") |> 
+adapense_pl <- cav_ada_naive_cv$cvres |>
+  select(lambda, cvavg, cvse) |>
+  mutate(method = "Adaptive PENSE") |>
   ggplot(aes(x = lambda, y = cvavg)) +
   geom_point(size = 2, shape = 1, color = COLORPAL[['green']]) +
   geom_linerange(aes(ymin = cvavg - 1 * cvse, ymax = cvavg + 1 * cvse),
@@ -353,50 +375,50 @@ cav_ada_ris_cv <- change_cv_measure(cav_ada_ris_cv, "wmape", max_solutions = 5)
 # The individual results may have different lambda grids, as the stage 1 estimate
 # can be different.
 # For plotting, we therefore use the lambda grid from the replicated estimate
-ind_cv_res <- cav_ind |> 
-  unlist(recursive = FALSE) |> 
+ind_cv_res <- cav_ind |>
+  unlist(recursive = FALSE) |>
   map(\(x) {
-    change_cv_measure(x, "wmape", max_solutions = 5)$cvres |> 
+    change_cv_measure(x, "wmape", max_solutions = 5)$cvres |>
       select(lambda_index, value = cvavg)
-  }) |> 
-  list_rbind(names_to = 'id') |> 
-  mutate(id = str_replace(id, 'naive', 'N-CV ') |> 
-           str_replace('ris', 'RIS-CV ')) |> 
-  arrange(id, desc(lambda_index)) %>% 
+  }) |>
+  list_rbind(names_to = 'id') |>
+  mutate(id = str_replace(id, 'naive', 'N-CV ') |>
+           str_replace('ris', 'RIS-CV ')) |>
+  arrange(id, desc(lambda_index)) %>%
   mutate(cv_type = str_extract(id, '[\\w-]+'))
 
 
 cv_plts <- list(`N-CV` = cav_ada_naive_cv$cvres,
-                `RIS-CV` = cav_ada_ris_cv$cvres) |> 
-  list_rbind(names_to = 'cv_type') |> 
-  transmute(cv_type, 
-            lambda_index, 
-            value = cvavg, 
+                `RIS-CV` = cav_ada_ris_cv$cvres) |>
+  list_rbind(names_to = 'cv_type') |>
+  transmute(cv_type,
+            lambda_index,
+            value = cvavg,
             ymin = cvavg - cvse,
-            ymax = cvavg + cvse) |> 
+            ymax = cvavg + cvse) |>
   mutate(panel = "Replicated CV",
-         id = cv_type) |> 
-  bind_rows(ind_cv_res |> 
+         id = cv_type) |>
+  bind_rows(ind_cv_res |>
               mutate(panel = "Individual CV runs",
                      ymin = value,
-                     ymax = value)) |> 
+                     ymax = value)) |>
   mutate(cv_type_lbl = case_match(cv_type,
                                   "N-CV" ~ 'Naïve-CV',
-                                  "RIS-CV" ~ 'RIS-CV')) |> 
-  group_by(cv_type) |> 
+                                  "RIS-CV" ~ 'RIS-CV')) |>
+  group_by(cv_type) |>
   group_map(.keep = TRUE, \(x, gr) {
     ylbl <- switch(gr$cv_type[[1]],
                    "N-CV"   = expression(paste(tau, "-size of prediction errors")),
                    "RIS-CV" = expression(paste("Weighted MAPE of prediction errors")))
-    
+
     tag <- switch(gr$cv_type[[1]],
                    "N-CV"   = "(a)",
                    "RIS-CV" = "(b)")
     left_margin <- switch(gr$cv_type[[1]],
                           "N-CV"   = 0.2,
                           "RIS-CV" = 0.4)
- 
-    x |> 
+
+    x |>
       ggplot(aes(x = lambda_index, y = value, color = cv_type, group = id)) +
       geom_line(aes(linetype = cv_type), linewidth = 0.5) +
       geom_point(aes(shape = cv_type), size = 2) +
