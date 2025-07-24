@@ -37,7 +37,7 @@ lapply(.libPaths(), \(lib) {
 })
 ```
 
-To run the R code it is necessary to install the following R packages from CRAN (step 1) and then install the copy of the pense package from the `pense/` folder (step 2).
+To run the R code it is necessary to install several R packages from CRAN (step 1) and then install the copy of the pense package from the `pense/` folder (step 2).
 
 ```r
 # R code
@@ -58,6 +58,7 @@ install.packages(c("tidyverse",
                    "stabledist",
                    "remotes"))
 
+# Step 2
 remotes::install_local("./pense")
 ```
 
